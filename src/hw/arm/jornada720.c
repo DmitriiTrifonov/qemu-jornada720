@@ -9,7 +9,7 @@
  *   0x00000000  system Flash/ROM, 32 MiB    (SA_CS0)
  *   0x1a000000  debug board CL-CD1284 UART  -- unimplemented-device stub
  *   0x40000000  SA-1111 companion chip      (SA_CS4) -- unimplemented-device stub
- *   0x48000000  Epson display controller    -- unimplemented-device stub
+ *   0x48000000  Epson display controller    -- registers + BitBLT engine
  *   0x48200000  Epson frame buffer, 512 KiB -- plain RAM + 640x240 RGB565 console
  *   0xC0000000  system SDRAM, 32 MiB        (SA_SDCS0)
  *
@@ -35,6 +35,7 @@
 #include "qom/object.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 
 #define J720_SA1111_BASE        0x40000000
 #define J720_SA1111_SIZE        (16 * MiB)
@@ -182,19 +183,51 @@ static const TypeInfo j720_ssi_stub_typeinfo = {
 };
 
 /*
- * Epson display controller -- first cut. The frame buffer is backed by
- * plain RAM (so whatever CE draws is kept instead of being dropped by an
- * unimplemented-device stub) and scanned out as a fixed 640x240, 16bpp
- * RGB565 panel starting at frame buffer offset 0, which is the Jornada
- * 720's native panel and the mode Linux's s1d13xxxfb uses on this board.
- * Display start address / stride / bpp registers of the Epson chip are
- * NOT decoded yet (its register block is still an unimplemented-device
- * stub), so a CE mode that differs from this guess will look garbled.
+ * Epson S1D13806 display controller (as on the Jornada 720, per Linux's
+ * s1d13xxxfb board setup). The frame buffer is plain RAM, scanned out as
+ * a fixed 640x240, 16bpp RGB565 panel from offset 0. Display start
+ * address / stride / bpp registers are NOT decoded; a CE mode that
+ * differs from this guess will look garbled.
+ *
+ * Registers 0x000-0x1ff are a plain register file, except for the 2D
+ * BitBLT engine (0x100-0x119 + data port at +0x100000) that CE's ddi.dll
+ * draws everything through. Implemented, 16bpp only, rectangular
+ * addressing only:
+ *   op 0x0/0x4 write blit (+transparent), 0x1 read blit,
+ *   0x2/0x3 move blit positive/negative, 0x5 transparent move,
+ *   0x6/0x7 pattern fill (+transparent), 0x8/0x9 color expansion
+ *   (+transparent), 0xc solid fill.
+ * Not implemented (logged under -d unimp): move with color expansion
+ * (0xa/0xb), linear addressing, 8bpp.
+ * Semantics are reconstructed from the S1D13806 register map and from
+ * what ddi.dll was observed to do; not verified against the datasheet.
  */
+#define J720_EPSON_NREGS        0x200
+#define J720_EPSON_BLT_DATA     0x100000
+
+#define EPSON_BLT_CTL0          0x100   /* b7 start/active, b6 FIFO not empty */
+#define EPSON_BLT_CTL1          0x101   /* b0 16bpp */
+#define EPSON_BLT_ROP           0x102   /* ROP code / color expansion start bit */
+#define EPSON_BLT_OP            0x103
+#define EPSON_BLT_SRC           0x104   /* 3 bytes, byte address */
+#define EPSON_BLT_DST           0x108   /* 3 bytes, byte address */
+#define EPSON_BLT_MEM_OFF       0x10c   /* 2 bytes, stride in 16-bit words */
+#define EPSON_BLT_WIDTH         0x110   /* 2 bytes, pixels - 1 */
+#define EPSON_BLT_HEIGHT        0x112   /* 2 bytes, lines - 1 */
+#define EPSON_BLT_BGC           0x114   /* 2 bytes */
+#define EPSON_BLT_FGC           0x118   /* 2 bytes */
+
 typedef struct J720Display {
     MemoryRegion fb;
+    MemoryRegion regs;
+    uint8_t reg[J720_EPSON_NREGS];
     QemuConsole *con;
     bool surface_set;
+
+    /* BitBLT operation in progress (write/read/color expansion blits) */
+    int blt_op;
+    uint32_t blt_x, blt_y, blt_w, blt_h;
+    uint32_t blt_bit;       /* color expansion: next bit in current word */
 } J720Display;
 
 static bool j720_display_update(void *opaque)
@@ -215,6 +248,266 @@ static bool j720_display_update(void *opaque)
 static void j720_display_invalidate(void *opaque)
 {
 }
+
+static uint32_t epson_reg16(J720Display *d, unsigned r)
+{
+    return d->reg[r] | (d->reg[r + 1] << 8);
+}
+
+static uint32_t epson_reg24(J720Display *d, unsigned r)
+{
+    return d->reg[r] | (d->reg[r + 1] << 8) | (d->reg[r + 2] << 16);
+}
+
+static uint16_t *epson_px(J720Display *d, uint32_t addr)
+{
+    uint8_t *fb = memory_region_get_ram_ptr(&d->fb);
+
+    return (uint16_t *)(fb + (addr & (J720_EPSON_FB_SIZE - 2)));
+}
+
+/* S1D13806 ROP codes: 16 boolean functions of source S and destination D */
+static uint16_t epson_rop(unsigned rop, uint16_t s, uint16_t dst)
+{
+    switch (rop & 0xf) {
+    case 0x0: return 0;
+    case 0x1: return ~(s | dst);
+    case 0x2: return ~s & dst;
+    case 0x3: return ~s;
+    case 0x4: return s & ~dst;
+    case 0x5: return ~dst;
+    case 0x6: return s ^ dst;
+    case 0x7: return ~(s & dst);
+    case 0x8: return s & dst;
+    case 0x9: return ~(s ^ dst);
+    case 0xa: return dst;
+    case 0xb: return ~s | dst;
+    case 0xc: return s;
+    case 0xd: return s | ~dst;
+    case 0xe: return s | dst;
+    default:  return 0xffff;
+    }
+}
+
+static uint32_t epson_stride(J720Display *d)
+{
+    return (epson_reg16(d, EPSON_BLT_MEM_OFF) & 0x7ff) * 2;
+}
+
+/* Address of pixel (x, y) of the current rectangle, relative to reg r */
+static uint32_t epson_rect_addr(J720Display *d, unsigned r, uint32_t x,
+                                uint32_t y)
+{
+    return epson_reg24(d, r) + y * epson_stride(d) + x * 2;
+}
+
+static void epson_blt_advance(J720Display *d)
+{
+    if (++d->blt_x >= d->blt_w) {
+        d->blt_x = 0;
+        d->blt_y++;
+        d->blt_bit = d->reg[EPSON_BLT_ROP] & 0xf;
+    }
+    if (d->blt_y >= d->blt_h) {
+        d->blt_op = -1;
+    }
+}
+
+/* One pixel pushed by the CPU through the data port (write blits) */
+static void epson_blt_push_pixel(J720Display *d, uint16_t s)
+{
+    uint16_t *p = epson_px(d, epson_rect_addr(d, EPSON_BLT_DST,
+                                              d->blt_x, d->blt_y));
+
+    if (d->blt_op != 0x4 || s != epson_reg16(d, EPSON_BLT_BGC)) {
+        *p = epson_rop(d->reg[EPSON_BLT_ROP], s, *p);
+    }
+    epson_blt_advance(d);
+}
+
+/* One 16-bit mono word pushed by the CPU (color expansion blits) */
+static void epson_blt_push_mono(J720Display *d, uint16_t w)
+{
+    uint32_t y = d->blt_y;
+    int bit;
+
+    for (bit = d->blt_bit; bit >= 0 && d->blt_op >= 0 && d->blt_y == y;
+         bit--) {
+        uint16_t *p = epson_px(d, epson_rect_addr(d, EPSON_BLT_DST,
+                                                  d->blt_x, d->blt_y));
+        if (w & (1 << bit)) {
+            *p = epson_reg16(d, EPSON_BLT_FGC);
+        } else if (d->blt_op == 0x8) {
+            *p = epson_reg16(d, EPSON_BLT_BGC);
+        }
+        epson_blt_advance(d);
+    }
+    if (d->blt_op >= 0 && d->blt_y == y) {
+        d->blt_bit = 15;
+    }
+}
+
+static void epson_blt_start(J720Display *d)
+{
+    unsigned op = d->reg[EPSON_BLT_OP] & 0xf;
+    unsigned rop = d->reg[EPSON_BLT_ROP];
+    uint32_t w = (epson_reg16(d, EPSON_BLT_WIDTH) & 0x3ff) + 1;
+    uint32_t h = (epson_reg16(d, EPSON_BLT_HEIGHT) & 0x3ff) + 1;
+    uint16_t fgc = epson_reg16(d, EPSON_BLT_FGC);
+    uint16_t bgc = epson_reg16(d, EPSON_BLT_BGC);
+    uint32_t stride = epson_stride(d);
+    uint32_t src = epson_reg24(d, EPSON_BLT_SRC);
+    uint32_t dst = epson_reg24(d, EPSON_BLT_DST);
+    uint32_t x, y;
+
+    if (!(d->reg[EPSON_BLT_CTL1] & 1) || (d->reg[EPSON_BLT_CTL0] & 3)) {
+        qemu_log_mask(LOG_UNIMP, "j720.epson: BitBLT mode ctl0=0x%02x "
+                      "ctl1=0x%02x not implemented\n",
+                      d->reg[EPSON_BLT_CTL0], d->reg[EPSON_BLT_CTL1]);
+    }
+
+    d->blt_op = -1;
+    d->blt_x = d->blt_y = 0;
+    d->blt_w = w;
+    d->blt_h = h;
+    d->blt_bit = rop & 0xf;
+
+    switch (op) {
+    case 0x0: /* write blit with ROP */
+    case 0x1: /* read blit */
+    case 0x4: /* transparent write blit */
+    case 0x8: /* color expansion */
+    case 0x9: /* transparent color expansion */
+        d->blt_op = op;
+        break;
+    case 0x2: /* move blit, positive direction, with ROP */
+    case 0x5: /* transparent move blit, positive direction */
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                uint16_t sp = *epson_px(d, src + y * stride + x * 2);
+                uint16_t *dp = epson_px(d, dst + y * stride + x * 2);
+                if (op == 0x2) {
+                    *dp = epson_rop(rop, sp, *dp);
+                } else if (sp != bgc) {
+                    *dp = sp;
+                }
+            }
+        }
+        break;
+    case 0x3: /* move blit, negative direction: addresses of last pixel */
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                uint16_t sp = *epson_px(d, src - y * stride - x * 2);
+                uint16_t *dp = epson_px(d, dst - y * stride - x * 2);
+                *dp = epson_rop(rop, sp, *dp);
+            }
+        }
+        break;
+    case 0x6: /* pattern fill with ROP: 8x8 pattern at src */
+    case 0x7: /* pattern fill with transparency */
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                uint32_t px = ((src >> 1) + x) & 7;
+                uint32_t py = ((src >> 4) + y) & 7;
+                uint16_t pp = *epson_px(d, (src & ~0x7f) + py * 16 + px * 2);
+                uint16_t *dp = epson_px(d, dst + y * stride + x * 2);
+                if (op == 0x6) {
+                    *dp = epson_rop(rop, pp, *dp);
+                } else if (pp != bgc) {
+                    *dp = pp;
+                }
+            }
+        }
+        break;
+    case 0xc: /* solid fill */
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < w; x++) {
+                *epson_px(d, dst + y * stride + x * 2) = fgc;
+            }
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.epson: BitBLT op 0x%x not implemented\n",
+                      op);
+        break;
+    }
+}
+
+static uint64_t j720_epson_regs_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720Display *d = opaque;
+    uint64_t v = 0;
+    unsigned i;
+
+    if (addr >= J720_EPSON_BLT_DATA) {
+        /* read blit: hand out source pixels, 16 bits at a time */
+        for (i = 0; i < size; i += 2) {
+            if (d->blt_op == 0x1) {
+                v |= (uint64_t)*epson_px(d, epson_rect_addr(d, EPSON_BLT_SRC,
+                                         d->blt_x, d->blt_y)) << (8 * i);
+                epson_blt_advance(d);
+            }
+        }
+        return v;
+    }
+    for (i = 0; i < size && addr + i < J720_EPSON_NREGS; i++) {
+        uint8_t b = d->reg[addr + i];
+        if (addr + i == EPSON_BLT_CTL0) {
+            b &= ~0xf0;
+            if (d->blt_op >= 0) {
+                b |= 0x80;
+            }
+            if (d->blt_op == 0x1) {
+                b |= 0x40;
+            }
+        }
+        v |= (uint64_t)b << (8 * i);
+    }
+    return v;
+}
+
+static void j720_epson_regs_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned size)
+{
+    J720Display *d = opaque;
+    unsigned i;
+
+    if (addr >= J720_EPSON_BLT_DATA) {
+        for (i = 0; i < size; i += 2) {
+            uint16_t w = value >> (8 * i);
+            switch (d->blt_op) {
+            case 0x0:
+            case 0x4:
+                epson_blt_push_pixel(d, w);
+                break;
+            case 0x8:
+            case 0x9:
+                epson_blt_push_mono(d, w);
+                break;
+            default:
+                break;
+            }
+        }
+        return;
+    }
+    for (i = 0; i < size && addr + i < J720_EPSON_NREGS; i++) {
+        d->reg[addr + i] = value >> (8 * i);
+    }
+    if (addr <= EPSON_BLT_CTL0 && EPSON_BLT_CTL0 < addr + size &&
+        (d->reg[EPSON_BLT_CTL0] & 0x80)) {
+        epson_blt_start(d);
+    }
+}
+
+static const MemoryRegionOps j720_epson_regs_ops = {
+    .read = j720_epson_regs_read,
+    .write = j720_epson_regs_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
 
 static const GraphicHwOps j720_display_ops = {
     .invalidate = j720_display_invalidate,
@@ -265,8 +558,6 @@ static void jornada720_init(MachineState *machine)
                                  J720_SA1111_SIZE);
     create_unimplemented_device("j720.debugboard", J720_DEBUGBOARD_BASE,
                                  J720_DEBUGBOARD_SIZE);
-    create_unimplemented_device("j720.epson-regs", J720_EPSON_REGS_BASE,
-                                 J720_EPSON_REGS_SIZE);
     create_unimplemented_device("j720.sa1110-pm", J720_SA1110_PM_BASE,
                                  J720_SA1110_PM_SIZE);
 
@@ -291,10 +582,16 @@ static void jornada720_init(MachineState *machine)
 
     ssi_create_peripheral(jms->sa1110->ssp_bus, TYPE_J720_SSI_STUB);
 
+    jms->display.blt_op = -1;
     memory_region_init_ram(&jms->display.fb, NULL, "j720.epson-fb",
                            J720_EPSON_FB_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), J720_EPSON_FB_BASE,
                                 &jms->display.fb);
+    memory_region_init_io(&jms->display.regs, NULL, &j720_epson_regs_ops,
+                          &jms->display, "j720.epson-regs",
+                          J720_EPSON_REGS_SIZE);
+    memory_region_add_subregion(get_system_memory(), J720_EPSON_REGS_BASE,
+                                &jms->display.regs);
     jms->display.con = qemu_graphic_console_create(NULL, 0, &j720_display_ops,
                                                    &jms->display);
 
