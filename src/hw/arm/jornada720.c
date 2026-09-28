@@ -10,7 +10,7 @@
  *   0x1a000000  debug board CL-CD1284 UART  -- unimplemented-device stub
  *   0x40000000  SA-1111 companion chip      (SA_CS4) -- unimplemented-device stub
  *   0x48000000  Epson display controller    -- unimplemented-device stub
- *   0x48200000  Epson frame buffer, 512 KiB -- unimplemented-device stub
+ *   0x48200000  Epson frame buffer, 512 KiB -- plain RAM + 640x240 RGB565 console
  *   0xC0000000  system SDRAM, 32 MiB        (SA_SDCS0)
  *
  * The stubs exist so boot-code probes of this not-yet-emulated hardware
@@ -29,9 +29,12 @@
 #include "hw/block/flash.h"
 #include "hw/misc/unimp.h"
 #include "hw/ssi/ssi.h"
+#include "ui/console.h"
+#include "ui/surface.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 
 #define J720_SA1111_BASE        0x40000000
 #define J720_SA1111_SIZE        (16 * MiB)
@@ -41,6 +44,8 @@
 #define J720_EPSON_REGS_SIZE    (2 * MiB)
 #define J720_EPSON_FB_BASE      0x48200000
 #define J720_EPSON_FB_SIZE      (512 * KiB)
+#define J720_LCD_WIDTH          640
+#define J720_LCD_HEIGHT         240
 
 #define J720_RAM_SIZE          (32 * MiB)
 #define J720_FLASH_SIZE        (32 * MiB)
@@ -176,10 +181,51 @@ static const TypeInfo j720_ssi_stub_typeinfo = {
     .class_init = j720_ssi_stub_class_init,
 };
 
+/*
+ * Epson display controller -- first cut. The frame buffer is backed by
+ * plain RAM (so whatever CE draws is kept instead of being dropped by an
+ * unimplemented-device stub) and scanned out as a fixed 640x240, 16bpp
+ * RGB565 panel starting at frame buffer offset 0, which is the Jornada
+ * 720's native panel and the mode Linux's s1d13xxxfb uses on this board.
+ * Display start address / stride / bpp registers of the Epson chip are
+ * NOT decoded yet (its register block is still an unimplemented-device
+ * stub), so a CE mode that differs from this guess will look garbled.
+ */
+typedef struct J720Display {
+    MemoryRegion fb;
+    QemuConsole *con;
+    bool surface_set;
+} J720Display;
+
+static bool j720_display_update(void *opaque)
+{
+    J720Display *d = opaque;
+
+    if (!d->surface_set) {
+        DisplaySurface *ds = qemu_create_displaysurface_from(
+            J720_LCD_WIDTH, J720_LCD_HEIGHT, PIXMAN_r5g6b5,
+            J720_LCD_WIDTH * 2, memory_region_get_ram_ptr(&d->fb));
+        qemu_console_set_surface(d->con, ds);
+        d->surface_set = true;
+    }
+    qemu_console_update_full(d->con);
+    return true;
+}
+
+static void j720_display_invalidate(void *opaque)
+{
+}
+
+static const GraphicHwOps j720_display_ops = {
+    .invalidate = j720_display_invalidate,
+    .gfx_update = j720_display_update,
+};
+
 struct Jornada720MachineState {
     MachineState parent;
 
     StrongARMState *sa1110;
+    J720Display display;
 };
 
 #define TYPE_JORNADA720_MACHINE MACHINE_TYPE_NAME("jornada720")
@@ -221,8 +267,6 @@ static void jornada720_init(MachineState *machine)
                                  J720_DEBUGBOARD_SIZE);
     create_unimplemented_device("j720.epson-regs", J720_EPSON_REGS_BASE,
                                  J720_EPSON_REGS_SIZE);
-    create_unimplemented_device("j720.epson-fb", J720_EPSON_FB_BASE,
-                                 J720_EPSON_FB_SIZE);
     create_unimplemented_device("j720.sa1110-pm", J720_SA1110_PM_BASE,
                                  J720_SA1110_PM_SIZE);
 
@@ -246,6 +290,13 @@ static void jornada720_init(MachineState *machine)
     }
 
     ssi_create_peripheral(jms->sa1110->ssp_bus, TYPE_J720_SSI_STUB);
+
+    memory_region_init_ram(&jms->display.fb, NULL, "j720.epson-fb",
+                           J720_EPSON_FB_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), J720_EPSON_FB_BASE,
+                                &jms->display.fb);
+    jms->display.con = qemu_graphic_console_create(NULL, 0, &j720_display_ops,
+                                                   &jms->display);
 
     /*
      * No arm_load_kernel() call here on purpose: we are not booting a
