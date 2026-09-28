@@ -28,6 +28,7 @@
 #include "strongarm.h"
 #include "hw/block/flash.h"
 #include "hw/misc/unimp.h"
+#include "hw/ssi/ssi.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 #include "qemu/error-report.h"
@@ -89,6 +90,49 @@ static const MemoryRegionOps j720_ssp_stub_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/*
+ * Nothing is wired up on the on-chip SSP's SSI bus (jms->sa1110->ssp_bus).
+ * Boot code was found (via QEMU monitor: PC=0x4f26c, R02=0x480001fc,
+ * R04/R05 = on-chip SSDR/SSSR, R06 = on-chip GPIO) to be bit-banging data
+ * out over this SSP -- almost certainly the serial config interface for
+ * the Epson display chip, using GPIO for chip-select -- and then waiting
+ * for a response that never comes because no SSIPeripheral is attached.
+ * This stub just answers every transfer with 0, enough to unblock
+ * whatever "did it ack" check the boot code does. See docs/research.md.
+ */
+#define TYPE_J720_SSI_STUB "j720-ssi-stub"
+OBJECT_DECLARE_SIMPLE_TYPE(J720SSIStubState, J720_SSI_STUB)
+
+struct J720SSIStubState {
+    SSIPeripheral parent_obj;
+};
+
+static uint32_t j720_ssi_stub_transfer(SSIPeripheral *dev, uint32_t val)
+{
+    return 0;
+}
+
+static void j720_ssi_stub_realize(SSIPeripheral *dev, Error **errp)
+{
+    /* Nothing to do; SSIPeripheralClass.realize is called unconditionally
+     * by ssi_peripheral_realize() with no NULL check, so this must exist. */
+}
+
+static void j720_ssi_stub_class_init(ObjectClass *klass, const void *data)
+{
+    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
+
+    k->realize = j720_ssi_stub_realize;
+    k->transfer = j720_ssi_stub_transfer;
+}
+
+static const TypeInfo j720_ssi_stub_typeinfo = {
+    .name = TYPE_J720_SSI_STUB,
+    .parent = TYPE_SSI_PERIPHERAL,
+    .instance_size = sizeof(J720SSIStubState),
+    .class_init = j720_ssi_stub_class_init,
+};
+
 struct Jornada720MachineState {
     MachineState parent;
 
@@ -147,6 +191,8 @@ static void jornada720_init(MachineState *machine)
                                              ssp_stub, 1);
     }
 
+    ssi_create_peripheral(jms->sa1110->ssp_bus, TYPE_J720_SSI_STUB);
+
     /*
      * No arm_load_kernel() call here on purpose: we are not booting a
      * Linux zImage via ATAGS. The Windows CE ROM contains its own boot
@@ -176,6 +222,7 @@ static const TypeInfo jornada720_machine_typeinfo = {
 
 static void jornada720_machine_register_types(void)
 {
+    type_register_static(&j720_ssi_stub_typeinfo);
     type_register_static(&jornada720_machine_typeinfo);
 }
 type_init(jornada720_machine_register_types);

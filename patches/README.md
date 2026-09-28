@@ -14,6 +14,7 @@
 cd qemu-src
 git apply ../patches/0001-wire-up-jornada720-machine.patch
 git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
+git apply ../patches/0003-fix-sssr-bit-positions.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -22,3 +23,11 @@ git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
   `strongarm_cp_reginfo`. Без этого реальный ROM Jornada 720 падает в
   Undefined Instruction на первых же сотнях инструкций загрузки (см.
   `docs/research.md`, раздел "Прогон реального ROM").
+- `0003-...` — правка `hw/arm/strongarm.c`: исправляет позиции битов SSSR
+  (SSP Status Register) на настоящие из SA-1110 Developer's Manual —
+  в QEMU они были скопированы из PXA25x и сдвинуты на 1 бит. Без этого
+  boot-код Jornada 720 виснет навсегда на poll'е SSP-статуса при общении
+  с Epson-дисплеем (см. `docs/research.md`, раздел про баг в SSSR).
+  Затрагивает общий код, используемый и другими платами (например
+  `collie`) — потенциально более правильно для всех них, но не проверено
+  на регрессии.
