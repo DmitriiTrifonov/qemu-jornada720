@@ -11,14 +11,17 @@
  *   0x40000000  SA-1111 companion chip      (SA_CS4) -- unimplemented-device stub
  *   0x48000000  Epson display controller    -- registers + BitBLT engine
  *   0x48200000  Epson frame buffer, 512 KiB -- plain RAM + 640x240 RGB565 console
+ *   0x80000000  SA-1110 USB device ctrl     -- read-back register stub
+ *   0x90020000  SA-1110 power manager       -- POSR stub
  *   0xC0000000  system SDRAM, 32 MiB        (SA_SDCS0)
+ *   on-chip SSP keyboard/touchscreen MCU    -- j720-mcu (GPIO0/9 IRQs)
  *
  * The stubs exist so boot-code probes of this not-yet-emulated hardware
  * are visible via -d unimp instead of silently spinning forever; see
  * jornada720_init().
  *
- * Step 1 goal (see docs/plan.md): boot far enough to see loader/CE output
- * on the on-chip UART. No display, no SA-1111, no input yet.
+ * Boots the Windows CE (H/PC 2000) ROM to a usable desktop with display,
+ * keyboard and touchscreen; needs -icount (see docs/research.md).
  */
 #include "qemu/osdep.h"
 #include "qemu/units.h"
@@ -31,6 +34,9 @@
 #include "hw/ssi/ssi.h"
 #include "ui/console.h"
 #include "ui/surface.h"
+#include "ui/input.h"
+#include "hw/core/irq.h"
+#include "standard-headers/linux/input-event-codes.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 #include "qemu/error-report.h"
@@ -140,46 +146,286 @@ static const MemoryRegionOps j720_pm_posr_stub_ops = {
 };
 
 /*
- * Nothing is wired up on the on-chip SSP's SSI bus (jms->sa1110->ssp_bus).
- * Boot code was found (via QEMU monitor: PC=0x4f26c, R02=0x480001fc,
- * R04/R05 = on-chip SSDR/SSSR, R06 = on-chip GPIO) to be bit-banging data
- * out over this SSP -- almost certainly the serial config interface for
- * the Epson display chip, using GPIO for chip-select -- and then waiting
- * for a response that never comes because no SSIPeripheral is attached.
- * This stub just answers every transfer with 0, enough to unblock
- * whatever "did it ack" check the boot code does. See docs/research.md.
+ * Keyboard/touchscreen/power micro-controller (MCU) on the SA-1110's
+ * on-chip SSP. Protocol from Linux (arch/arm/mach-sa1100/jornada720_ssp.c,
+ * drivers/input/{keyboard,touchscreen}/jornada720_*.c), confirmed by
+ * logging what the CE ROM sends: bytes go over the wire bit-reversed;
+ * the MCU answers a command byte with TXDUMMY (0x11) in the same
+ * transfer and then hands out data bytes, one per following transfer.
+ * GPIO0 falls when key codes are waiting, GPIO9 is low while the pen is
+ * down and pulses high once per new sample (Linux's driver triggers on
+ * the rising edge only and treats "line still high" as pen up; CE
+ * switches GPIO9 to rising edge after the first touch), GPIO10 low = MCU
+ * ready (always, here).
+ *
+ * The battery answer (GETBATTERYDATA) is a guess: 3 bytes, main and
+ * backup battery 10-bit readings, low bytes then a byte of high bits
+ * (same packing as the touch samples).
  */
-#define TYPE_J720_SSI_STUB "j720-ssi-stub"
-OBJECT_DECLARE_SIMPLE_TYPE(J720SSIStubState, J720_SSI_STUB)
+#define J720_MCU_TXDUMMY          0x11
+#define J720_MCU_GETBATTERYDATA   0xc0
+#define J720_MCU_GETSCANKEYCODE   0x90
+#define J720_MCU_GETTOUCHSAMPLES  0xa0
+#define J720_MCU_GETCONTRAST      0xd0
+#define J720_MCU_SETCONTRAST      0xd1
+#define J720_MCU_GETBRIGHTNESS    0xd2
+#define J720_MCU_SETBRIGHTNESS    0xd3
 
-struct J720SSIStubState {
-    SSIPeripheral parent_obj;
+#define J720_GPIO_KBD_IRQ   0
+#define J720_GPIO_TS_IRQ    9
+
+#define J720_MCU_KEYQ       16
+#define J720_MCU_TS_PERIOD_MS 10
+
+static const unsigned short j720_keymap[128] = {					/* ROW */
+	0, KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,		/* #1  */
+	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE,	/*  -> */
+	0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,		/* #2  */
+	KEY_0, KEY_MINUS, KEY_EQUAL,0, 0, 0,						/*  -> */
+	0, KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O,		/* #3  */
+	KEY_P, KEY_BACKSLASH, KEY_BACKSPACE, 0, 0, 0,					/*  -> */
+	0, KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,		/* #4  */
+	KEY_SEMICOLON, KEY_LEFTBRACE, KEY_RIGHTBRACE, 0, 0, 0,				/*  -> */
+	0, KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M, KEY_COMMA,			/* #5  */
+	KEY_DOT, KEY_KPMINUS, KEY_APOSTROPHE, KEY_ENTER, 0, 0,0,			/*  -> */
+	0, KEY_TAB, 0, KEY_LEFTSHIFT, 0, KEY_APOSTROPHE, 0, 0, 0, 0,			/* #6  */
+	KEY_UP, 0, KEY_RIGHTSHIFT, 0, 0, 0,0, 0, 0, 0, 0, KEY_LEFTALT, KEY_GRAVE,	/*  -> */
+	0, 0, KEY_LEFT, KEY_DOWN, KEY_RIGHT, 0, 0, 0, 0,0, KEY_KPASTERISK,		/*  -> */
+	KEY_LEFTCTRL, 0, KEY_SPACE, 0, 0, 0, KEY_SLASH, KEY_DELETE, 0, 0,		/*  -> */
+	0, 0, 0, KEY_POWER,								/*  -> */
 };
 
-static uint32_t j720_ssi_stub_transfer(SSIPeripheral *dev, uint32_t val)
+
+#define TYPE_J720_MCU "j720-mcu"
+OBJECT_DECLARE_SIMPLE_TYPE(J720MCUState, J720_MCU)
+
+struct J720MCUState {
+    SSIPeripheral parent_obj;
+
+    qemu_irq kbd_irq;           /* GPIO0, active low */
+    qemu_irq ts_irq;            /* GPIO9, low while pen down */
+
+    uint8_t out[16];            /* data bytes waiting to be clocked out */
+    int out_len, out_pos;
+    int expect_data;            /* SET* command: next byte is its value */
+    uint8_t contrast, brightness;
+
+    uint8_t keyq[J720_MCU_KEYQ];
+    int keyq_len;
+
+    bool pen_down;
+    int pen_x, pen_y;           /* 10-bit ADC values */
+    QEMUTimer *ts_timer;        /* sample pulses on GPIO9 while pen down */
+};
+
+static uint8_t j720_bitrev8(uint8_t b)
 {
-    return 0;
+    b = (b & 0xf0) >> 4 | (b & 0x0f) << 4;
+    b = (b & 0xcc) >> 2 | (b & 0x33) << 2;
+    return (b & 0xaa) >> 1 | (b & 0x55) << 1;
 }
 
-static void j720_ssi_stub_realize(SSIPeripheral *dev, Error **errp)
+static void j720_mcu_put(J720MCUState *s, uint8_t b)
 {
-    /* Nothing to do; SSIPeripheralClass.realize is called unconditionally
-     * by ssi_peripheral_realize() with no NULL check, so this must exist. */
+    if (s->out_len < (int)sizeof(s->out)) {
+        s->out[s->out_len++] = b;
+    }
 }
 
-static void j720_ssi_stub_class_init(ObjectClass *klass, const void *data)
+static void j720_mcu_put_samples(J720MCUState *s, int v0, int v1, int v2)
+{
+    j720_mcu_put(s, v0);
+    j720_mcu_put(s, v1);
+    j720_mcu_put(s, v2);
+}
+
+static uint8_t j720_mcu_high_bits(int v)
+{
+    /* high 2 bits of three identical samples, packed as the ts driver expects */
+    v = (v >> 8) & 3;
+    return v | v << 2 | v << 4;
+}
+
+static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
+{
+    int i;
+
+    if (s->expect_data) {
+        if (s->expect_data == J720_MCU_SETCONTRAST) {
+            s->contrast = c;
+        } else {
+            s->brightness = c;
+        }
+        s->expect_data = 0;
+        return J720_MCU_TXDUMMY;
+    }
+
+    if (s->out_pos < s->out_len) {
+        uint8_t b = s->out[s->out_pos++];
+        if (s->out_pos == s->out_len) {
+            s->out_len = s->out_pos = 0;
+        }
+        return b;
+    }
+
+    s->out_len = s->out_pos = 0;
+    switch (c) {
+    case J720_MCU_GETSCANKEYCODE:
+        j720_mcu_put(s, s->keyq_len);
+        for (i = 0; i < s->keyq_len; i++) {
+            j720_mcu_put(s, s->keyq[i]);
+        }
+        s->keyq_len = 0;
+        qemu_irq_raise(s->kbd_irq);
+        break;
+    case J720_MCU_GETTOUCHSAMPLES:
+        j720_mcu_put_samples(s, s->pen_x & 0xff, s->pen_x & 0xff,
+                             s->pen_x & 0xff);
+        j720_mcu_put_samples(s, s->pen_y & 0xff, s->pen_y & 0xff,
+                             s->pen_y & 0xff);
+        j720_mcu_put(s, j720_mcu_high_bits(s->pen_x));
+        j720_mcu_put(s, j720_mcu_high_bits(s->pen_y));
+        break;
+    case J720_MCU_GETBATTERYDATA:
+        j720_mcu_put(s, 0x00);          /* main battery, low byte */
+        j720_mcu_put(s, 0x00);          /* backup battery, low byte */
+        j720_mcu_put(s, 0x0f);          /* high bits: both 0x300 */
+        break;
+    case J720_MCU_GETCONTRAST:
+        j720_mcu_put(s, s->contrast);
+        break;
+    case J720_MCU_GETBRIGHTNESS:
+        j720_mcu_put(s, s->brightness);
+        break;
+    case J720_MCU_SETCONTRAST:
+    case J720_MCU_SETBRIGHTNESS:
+        s->expect_data = c;
+        break;
+    case J720_MCU_TXDUMMY:
+    case 0x88:  /* CE clocks data out with this one */
+        return J720_MCU_TXDUMMY;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.mcu: command 0x%02x\n", c);
+        break;
+    }
+    return J720_MCU_TXDUMMY;
+}
+
+static uint32_t j720_mcu_transfer(SSIPeripheral *dev, uint32_t val)
+{
+    J720MCUState *s = J720_MCU(dev);
+
+    return j720_bitrev8(j720_mcu_byte(s, j720_bitrev8(val)));
+}
+
+static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
+                               QemuInputEvent *evt)
+{
+    J720MCUState *s = J720_MCU(dev);
+    unsigned int lnx = evt->key.key;    /* Linux key code */
+    int code;
+
+    for (code = 1; code < 128; code++) {
+        if (j720_keymap[code] == lnx) {
+            break;
+        }
+    }
+    if (code == 128 || s->keyq_len == J720_MCU_KEYQ) {
+        return;
+    }
+    s->keyq[s->keyq_len++] = code | (evt->key.down ? 0 : 0x80);
+    qemu_irq_lower(s->kbd_irq);
+}
+
+static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
+                                   QemuInputEvent *evt)
+{
+    J720MCUState *s = J720_MCU(dev);
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_ABS: {
+        InputMoveEvent *move = &evt->abs;
+        /* map the whole screen onto most of the 10-bit ADC range */
+        int v = qemu_input_scale_axis(move->value, INPUT_EVENT_ABS_MIN,
+                                      INPUT_EVENT_ABS_MAX, 64, 960);
+        if (move->axis == INPUT_AXIS_X) {
+            s->pen_x = v;
+        } else if (move->axis == INPUT_AXIS_Y) {
+            s->pen_y = v;
+        }
+        break;
+    }
+    case INPUT_EVENT_KIND_BTN: {
+        InputBtnEvent *btn = &evt->btn;
+        if (btn->button == INPUT_BUTTON_LEFT) {
+            s->pen_down = btn->down;
+            qemu_set_irq(s->ts_irq, !s->pen_down);
+            if (s->pen_down) {
+                timer_mod(s->ts_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                          J720_MCU_TS_PERIOD_MS);
+            } else {
+                timer_del(s->ts_timer);
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static void j720_mcu_ts_tick(void *opaque)
+{
+    J720MCUState *s = opaque;
+
+    if (s->pen_down) {
+        qemu_irq_raise(s->ts_irq);
+        qemu_irq_lower(s->ts_irq);
+        timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_TS_PERIOD_MS);
+    }
+}
+
+static const QemuInputHandler j720_mcu_kbd_handler = {
+    .name  = "Jornada 720 keyboard",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = j720_mcu_key_event,
+};
+
+static const QemuInputHandler j720_mcu_ts_handler = {
+    .name  = "Jornada 720 touchscreen",
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+    .event = j720_mcu_pointer_event,
+};
+
+static void j720_mcu_realize(SSIPeripheral *dev, Error **errp)
+{
+    J720MCUState *s = J720_MCU(dev);
+    QemuInputHandlerState *hs;
+
+    s->contrast = 0x80;
+    s->brightness = 0x80;
+    s->ts_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, j720_mcu_ts_tick, s);
+    hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_kbd_handler);
+    qemu_input_handler_activate(hs);
+    hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_ts_handler);
+    qemu_input_handler_activate(hs);
+}
+
+static void j720_mcu_class_init(ObjectClass *klass, const void *data)
 {
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
 
-    k->realize = j720_ssi_stub_realize;
-    k->transfer = j720_ssi_stub_transfer;
+    k->realize = j720_mcu_realize;
+    k->transfer = j720_mcu_transfer;
 }
 
-static const TypeInfo j720_ssi_stub_typeinfo = {
-    .name = TYPE_J720_SSI_STUB,
+static const TypeInfo j720_mcu_typeinfo = {
+    .name = TYPE_J720_MCU,
     .parent = TYPE_SSI_PERIPHERAL,
-    .instance_size = sizeof(J720SSIStubState),
-    .class_init = j720_ssi_stub_class_init,
+    .instance_size = sizeof(J720MCUState),
+    .class_init = j720_mcu_class_init,
 };
 
 /*
@@ -514,6 +760,45 @@ static const GraphicHwOps j720_display_ops = {
     .gfx_update = j720_display_update,
 };
 
+/*
+ * SA-1110 on-chip USB device controller (0x80000000), missing from
+ * strongarm.c. CE's udcser.dll (ActiveSync over USB, running inside
+ * device.exe) sets UDCCR bit 0 (UDC disable) and spins until it reads
+ * back as 1 -- forever, on an empty bus, starving the GUI. This is only
+ * a read-back register file (no USB), logged under -d unimp.
+ */
+#define J720_SA1110_UDC_BASE 0x80000000
+#define J720_SA1110_UDC_SIZE 0x100
+
+static uint64_t j720_udc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t *reg = opaque;
+
+    qemu_log_mask(LOG_UNIMP, "j720.sa1110-udc: read 0x%02" HWADDR_PRIx "\n",
+                  addr);
+    return reg[addr >> 2];
+}
+
+static void j720_udc_write(void *opaque, hwaddr addr, uint64_t value,
+                           unsigned size)
+{
+    uint32_t *reg = opaque;
+
+    qemu_log_mask(LOG_UNIMP, "j720.sa1110-udc: write 0x%02" HWADDR_PRIx
+                  " value 0x%" PRIx64 "\n", addr, value);
+    reg[addr >> 2] = value;
+}
+
+static const MemoryRegionOps j720_udc_ops = {
+    .read = j720_udc_read,
+    .write = j720_udc_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 struct Jornada720MachineState {
     MachineState parent;
 
@@ -572,6 +857,15 @@ static void jornada720_init(MachineState *machine)
     }
 
     {
+        MemoryRegion *udc = g_new(MemoryRegion, 1);
+        memory_region_init_io(udc, NULL, &j720_udc_ops,
+                              g_new0(uint32_t, J720_SA1110_UDC_SIZE / 4),
+                              "j720.sa1110-udc", J720_SA1110_UDC_SIZE);
+        memory_region_add_subregion(get_system_memory(), J720_SA1110_UDC_BASE,
+                                    udc);
+    }
+
+    {
         MemoryRegion *pm_posr_stub = g_new(MemoryRegion, 1);
         memory_region_init_io(pm_posr_stub, NULL, &j720_pm_posr_stub_ops, NULL,
                                "j720.sa1110-pm-posr-stub", 4);
@@ -580,7 +874,14 @@ static void jornada720_init(MachineState *machine)
                                              pm_posr_stub, 1);
     }
 
-    ssi_create_peripheral(jms->sa1110->ssp_bus, TYPE_J720_SSI_STUB);
+    {
+        J720MCUState *mcu = J720_MCU(ssi_create_peripheral(
+                                jms->sa1110->ssp_bus, TYPE_J720_MCU));
+        mcu->kbd_irq = qdev_get_gpio_in(jms->sa1110->gpio, J720_GPIO_KBD_IRQ);
+        mcu->ts_irq = qdev_get_gpio_in(jms->sa1110->gpio, J720_GPIO_TS_IRQ);
+        qemu_irq_raise(mcu->kbd_irq);   /* no key codes waiting */
+        qemu_irq_raise(mcu->ts_irq);    /* pen up */
+    }
 
     jms->display.blt_op = -1;
     memory_region_init_ram(&jms->display.fb, NULL, "j720.epson-fb",
@@ -624,7 +925,7 @@ static const TypeInfo jornada720_machine_typeinfo = {
 
 static void jornada720_machine_register_types(void)
 {
-    type_register_static(&j720_ssi_stub_typeinfo);
+    type_register_static(&j720_mcu_typeinfo);
     type_register_static(&jornada720_machine_typeinfo);
 }
 type_init(jornada720_machine_register_types);

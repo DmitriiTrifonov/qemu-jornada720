@@ -17,6 +17,7 @@ git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
 git apply ../patches/0003-fix-sssr-bit-positions.patch
 git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
 git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
+git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -45,3 +46,9 @@ git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
   Abort, который не разрешается через `LoadPageTable`, приводит к вечному
   Data Abort на `0xffff5070` (см. `docs/research.md`). Не проверено на
   регрессии для `collie`.
+- `0006-...` — правка `hw/arm/strongarm.c` (применять после `0003`, тот же
+  файл): при 8-битном кадре SSP берёт передаваемый байт из старшей половины
+  16-битного SSDR, если он записан туда. И CE-ROM, и Linux
+  (`jornada720_ssp.c`) пишут в SSDR `byte << 8`; без правки QEMU обрезал это
+  до нуля, и MCU клавиатуры/тачскрина ничего не получал. По мануалу SA-1110
+  не сверено (bitsavers был недоступен). Не проверено на регрессии для `collie`.

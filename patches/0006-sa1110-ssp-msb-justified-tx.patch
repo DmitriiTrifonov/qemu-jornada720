@@ -1,0 +1,26 @@
+diff --git a/hw/arm/strongarm.c b/hw/arm/strongarm.c
+index b57c3f4..fd31f8f 100644
+--- a/hw/arm/strongarm.c
++++ b/hw/arm/strongarm.c
+@@ -1516,9 +1516,20 @@ static void strongarm_ssp_write(void *opaque, hwaddr addr,
+     case SSDR:
+         if (SSCR0_UWIRE(s->sscr[0])) {
+             value &= 0xff;
+-        } else
++        } else {
++            /*
++             * Local experiment for the qemu-jornada720 project: both the
++             * Jornada 720 Windows CE ROM and Linux's jornada720_ssp.c
++             * write 8-bit frames (DSS=8) as "byte << 8", which only works
++             * if transmit data is taken MSB-justified from the 16-bit
++             * SSDR. Not verified against the SA-1110 manual.
++             */
++            if (value & ~((1 << SSCR0_DSS(s->sscr[0])) - 1) & 0xffff) {
++                value >>= 16 - SSCR0_DSS(s->sscr[0]);
++            }
+             /* Note how 32bits overflow does no harm here */
+             value &= (1 << SSCR0_DSS(s->sscr[0])) - 1;
++        }
+ 
+         /* Data goes from here to the Tx FIFO and is shifted out from
+          * there directly to the slave, no need to buffer it.
