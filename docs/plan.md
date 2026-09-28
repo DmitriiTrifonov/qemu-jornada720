@@ -6,9 +6,11 @@
 
 ## 0. Подготовка окружения
 
-- [ ] Склонировать исходники QEMU, собрать `qemu-system-arm` из исходников
+- [x] Склонировать исходники QEMU, собрать `qemu-system-arm` из исходников
   локально (понадобится для итерации на machine-файле — apt/apk-пакет
   тут не подойдёт, т.к. будем менять код).
+  Готово: `qemu-src/` (shallow clone), собрано в `build/` (`--target-list=arm-softmmu`),
+  бинарник `build/qemu-system-arm` v11.1.50, `-M collie` доступна.
 - [ ] Прочитать и законспектировать `hw/arm/collie.c` + `hw/arm/strongarm.c`/
   `strongarm.h` — что конкретно предоставляет strongarm.c "из коробки"
   (UART, GPIO, timers, RTC, PCMCIA, DMA, LCD controller), а что machine-файл
