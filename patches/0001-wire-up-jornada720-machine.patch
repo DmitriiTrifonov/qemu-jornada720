@@ -1,0 +1,30 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index eae0636..af315b0 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -221,6 +221,13 @@ config COLLIE
+     select ZAURUS_SCOOP
+     select STRONGARM
+ 
++config JORNADA720
++    bool
++    default y
++    depends on TCG && ARM
++    select PFLASH_CFI01
++    select STRONGARM
++
+ config SX1
+     bool
+     default y
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index bcc068d..b68ec1d 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -101,6 +101,7 @@ arm_common_ss.add(when: 'CONFIG_XEN', if_true: files(
+ arm_common_ss.add(when: 'CONFIG_ARM_SMMUV3', if_true: files('smmu-common.c'))
+ arm_common_ss.add(when: 'CONFIG_COLLIE', if_true: files('collie.c'))
+ arm_common_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4_boards.c'))
++arm_common_ss.add(when: 'CONFIG_JORNADA720', if_true: files('jornada720.c'))
+ arm_common_ss.add(when: 'CONFIG_MAX78000FTHR', if_true: files('max78000fthr.c'))
+ arm_common_ss.add(when: 'CONFIG_NETDUINO2', if_true: files('netduino2.c'))
+ arm_common_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_peripherals.c'))
