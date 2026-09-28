@@ -1,0 +1,24 @@
+diff --git a/target/arm/tcg/translate.c b/target/arm/tcg/translate.c
+index 8c56348..d71661d 100644
+--- a/target/arm/tcg/translate.c
++++ b/target/arm/tcg/translate.c
+@@ -6168,6 +6168,19 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
+          * for miscellaneous unconditional instructions.
+          */
+         if (!arm_dc_feature(s, ARM_FEATURE_V5)) {
++            /*
++             * Local experiment for the qemu-jornada720 project: real
++             * StrongARM (SA-1100/SA-1110) silicon treats NV as "never
++             * execute", i.e. a NOP, and Windows CE's ARM exception
++             * dispatch relies on it (its prefetch-abort handler falls
++             * through two NV-conditioned words, one of them a literal,
++             * into the common handler). UNDEF-ing here sends CE down
++             * its nested-fault path and it dies saving context above
++             * the abort stack.
++             */
++            if (arm_dc_feature(s, ARM_FEATURE_STRONGARM)) {
++                return;
++            }
+             unallocated_encoding(s);
+             return;
+         }

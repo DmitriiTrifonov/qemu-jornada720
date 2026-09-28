@@ -16,6 +16,7 @@ git apply ../patches/0001-wire-up-jornada720-machine.patch
 git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
 git apply ../patches/0003-fix-sssr-bit-positions.patch
 git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
+git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -38,3 +39,9 @@ git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
   отображению (классическая идиома MMU-enable, на которую полагается ROM).
   Без этого — Prefetch Abort сразу после включения MMU (см. `docs/research.md`,
   разделы про MMU-enable). Не проверено на регрессии для `collie`.
+- `0005-...` — правка `target/arm/tcg/translate.c`: на StrongARM инструкции
+  с условием NV (`cond=0xF`) — NOP, а не UNDEF, как на реальном SA-1110. На
+  этом держится диспетчер исключений WinCE: без фикса первый же Prefetch
+  Abort, который не разрешается через `LoadPageTable`, приводит к вечному
+  Data Abort на `0xffff5070` (см. `docs/research.md`). Не проверено на
+  регрессии для `collie`.
