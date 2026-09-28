@@ -228,6 +228,8 @@ struct J720MCUState {
     bool pen_up_pending;        /* released before enough samples were read */
     int pen_samples;            /* GETTOUCHSAMPLES answered since pen down */
     int pen_x, pen_y;           /* 10-bit ADC values */
+    int abs_x, abs_y;           /* last absolute pointer position from the UI */
+    bool debug;                 /* J720_TOUCH_DEBUG set: log pen events */
     QEMUTimer *ts_timer;        /* sample pulses on GPIO9 while pen down */
 };
 
@@ -392,8 +394,10 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
                                       INPUT_EVENT_ABS_MAX, 64, 960);
         if (move->axis == INPUT_AXIS_X) {
             s->pen_x = v;
+            s->abs_x = move->value;
         } else if (move->axis == INPUT_AXIS_Y) {
             s->pen_y = v;
+            s->abs_y = move->value;
         }
         break;
     }
@@ -401,6 +405,16 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
         InputBtnEvent *btn = &evt->btn;
         if (btn->button != INPUT_BUTTON_LEFT) {
             break;
+        }
+        if (s->debug) {
+            fprintf(stderr, "j720 touch: pen %s ui=(%d,%d) ~px=(%d,%d) "
+                    "adc=(%d,%d) samples=%d\n", btn->down ? "down" : "up",
+                    s->abs_x, s->abs_y,
+                    (int)((int64_t)s->abs_x * J720_LCD_WIDTH /
+                          (INPUT_EVENT_ABS_MAX + 1)),
+                    (int)((int64_t)s->abs_y * J720_LCD_HEIGHT /
+                          (INPUT_EVENT_ABS_MAX + 1)),
+                    s->pen_x, s->pen_y, s->pen_samples);
         }
         if (btn->down) {
             s->pen_down = true;
@@ -441,6 +455,7 @@ static void j720_mcu_realize(SSIPeripheral *dev, Error **errp)
     s->contrast = 0x80;
     s->brightness = 0x80;
     s->ts_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, j720_mcu_ts_tick, s);
+    s->debug = getenv("J720_TOUCH_DEBUG") != NULL;
     hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_kbd_handler);
     qemu_input_handler_activate(hs);
     hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_ts_handler);
