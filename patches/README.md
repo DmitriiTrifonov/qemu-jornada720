@@ -20,6 +20,7 @@ git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
 git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
 git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
 git apply ../patches/0008-sa1110-c15-idle-wfi.patch
+git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -65,3 +66,8 @@ git apply ../patches/0008-sa1110-c15-idle-wfi.patch
   StrongARM `c15,c8,2` — ждать прерывания (WFI), `c15,c1,2`/`c15,c2,2`
   (переключение тактов) — пустые операции. Так ядро CE уходит в простой.
   Заметного эффекта пока нет: CE и «в простое» постоянно чем-то занят.
+- `0009-...` — правка `ui/sdl2.c` (после `0007`): при абсолютном указателе
+  (тачскрин) SDL не захватывает ввод. QEMU выставляет
+  `SDL_HINT_GRAB_KEYBOARD=1`, и захват, срабатывавший при наведении,
+  на Wayland блокировал все горячие клавиши sway: окно нельзя было
+  закрыть. Плюс Ctrl+Alt+Q — выход, как в GTK-интерфейсе QEMU.

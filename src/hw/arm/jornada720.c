@@ -496,6 +496,13 @@ typedef struct J720Display {
     uint8_t reg[J720_EPSON_NREGS];
     QemuConsole *con;
     bool surface_set;
+    bool invalidate;
+    /*
+     * Lines touched by the BitBLT engine since the last refresh: it
+     * writes the frame buffer through the RAM pointer, which the dirty
+     * log used for CPU writes does not see.
+     */
+    int blt_dirty_lo, blt_dirty_hi;
 
     /* BitBLT operation in progress (write/read/color expansion blits) */
     int blt_op;
@@ -503,23 +510,53 @@ typedef struct J720Display {
     uint32_t blt_bit;       /* color expansion: next bit in current word */
 } J720Display;
 
+#define J720_LCD_LINE_BYTES     (J720_LCD_WIDTH * 2)
+
+/* Only push the lines that changed: a full refresh every frame is costly
+ * on a slow host, especially when SDL scales it up to a phone screen. */
 static bool j720_display_update(void *opaque)
 {
     J720Display *d = opaque;
+    DirtyBitmapSnapshot *snap;
+    int y, lo = J720_LCD_HEIGHT, hi = -1;
 
     if (!d->surface_set) {
         DisplaySurface *ds = qemu_create_displaysurface_from(
             J720_LCD_WIDTH, J720_LCD_HEIGHT, PIXMAN_r5g6b5,
-            J720_LCD_WIDTH * 2, memory_region_get_ram_ptr(&d->fb));
+            J720_LCD_LINE_BYTES, memory_region_get_ram_ptr(&d->fb));
         qemu_console_set_surface(d->con, ds);
         d->surface_set = true;
+        d->invalidate = true;
     }
-    qemu_console_update_full(d->con);
+
+    snap = memory_region_snapshot_and_clear_dirty(&d->fb, 0,
+                J720_LCD_LINE_BYTES * J720_LCD_HEIGHT, DIRTY_MEMORY_VGA);
+    for (y = 0; y < J720_LCD_HEIGHT; y++) {
+        if (d->invalidate ||
+            (y >= d->blt_dirty_lo && y <= d->blt_dirty_hi) ||
+            memory_region_snapshot_get_dirty(&d->fb, snap,
+                                             y * J720_LCD_LINE_BYTES,
+                                             J720_LCD_LINE_BYTES)) {
+            lo = MIN(lo, y);
+            hi = y;
+        }
+    }
+    g_free(snap);
+    d->invalidate = false;
+    d->blt_dirty_lo = INT_MAX;
+    d->blt_dirty_hi = -1;
+
+    if (hi >= lo) {
+        qemu_console_update(d->con, 0, lo, J720_LCD_WIDTH, hi - lo + 1);
+    }
     return true;
 }
 
 static void j720_display_invalidate(void *opaque)
 {
+    J720Display *d = opaque;
+
+    d->invalidate = true;
 }
 
 static uint32_t epson_reg16(J720Display *d, unsigned r)
@@ -537,6 +574,16 @@ static uint16_t *epson_px(J720Display *d, uint32_t addr)
     uint8_t *fb = memory_region_get_ram_ptr(&d->fb);
 
     return (uint16_t *)(fb + (addr & (J720_EPSON_FB_SIZE - 2)));
+}
+
+/* Pointer to a pixel the engine is about to write; records the line */
+static uint16_t *epson_px_w(J720Display *d, uint32_t addr)
+{
+    int y = (addr & (J720_EPSON_FB_SIZE - 2)) / J720_LCD_LINE_BYTES;
+
+    d->blt_dirty_lo = MIN(d->blt_dirty_lo, y);
+    d->blt_dirty_hi = MAX(d->blt_dirty_hi, y);
+    return epson_px(d, addr);
 }
 
 /* S1D13806 ROP codes: 16 boolean functions of source S and destination D */
@@ -589,8 +636,8 @@ static void epson_blt_advance(J720Display *d)
 /* One pixel pushed by the CPU through the data port (write blits) */
 static void epson_blt_push_pixel(J720Display *d, uint16_t s)
 {
-    uint16_t *p = epson_px(d, epson_rect_addr(d, EPSON_BLT_DST,
-                                              d->blt_x, d->blt_y));
+    uint16_t *p = epson_px_w(d, epson_rect_addr(d, EPSON_BLT_DST,
+                                                d->blt_x, d->blt_y));
 
     if (d->blt_op != 0x4 || s != epson_reg16(d, EPSON_BLT_BGC)) {
         *p = epson_rop(d->reg[EPSON_BLT_ROP], s, *p);
@@ -606,8 +653,8 @@ static void epson_blt_push_mono(J720Display *d, uint16_t w)
 
     for (bit = d->blt_bit; bit >= 0 && d->blt_op >= 0 && d->blt_y == y;
          bit--) {
-        uint16_t *p = epson_px(d, epson_rect_addr(d, EPSON_BLT_DST,
-                                                  d->blt_x, d->blt_y));
+        uint16_t *p = epson_px_w(d, epson_rect_addr(d, EPSON_BLT_DST,
+                                                    d->blt_x, d->blt_y));
         if (w & (1 << bit)) {
             *p = epson_reg16(d, EPSON_BLT_FGC);
         } else if (d->blt_op == 0x8) {
@@ -658,7 +705,7 @@ static void epson_blt_start(J720Display *d)
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 uint16_t sp = *epson_px(d, src + y * stride + x * 2);
-                uint16_t *dp = epson_px(d, dst + y * stride + x * 2);
+                uint16_t *dp = epson_px_w(d, dst + y * stride + x * 2);
                 if (op == 0x2) {
                     *dp = epson_rop(rop, sp, *dp);
                 } else if (sp != bgc) {
@@ -671,7 +718,7 @@ static void epson_blt_start(J720Display *d)
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
                 uint16_t sp = *epson_px(d, src - y * stride - x * 2);
-                uint16_t *dp = epson_px(d, dst - y * stride - x * 2);
+                uint16_t *dp = epson_px_w(d, dst - y * stride - x * 2);
                 *dp = epson_rop(rop, sp, *dp);
             }
         }
@@ -683,7 +730,7 @@ static void epson_blt_start(J720Display *d)
                 uint32_t px = ((src >> 1) + x) & 7;
                 uint32_t py = ((src >> 4) + y) & 7;
                 uint16_t pp = *epson_px(d, (src & ~0x7f) + py * 16 + px * 2);
-                uint16_t *dp = epson_px(d, dst + y * stride + x * 2);
+                uint16_t *dp = epson_px_w(d, dst + y * stride + x * 2);
                 if (op == 0x6) {
                     *dp = epson_rop(rop, pp, *dp);
                 } else if (pp != bgc) {
@@ -695,7 +742,7 @@ static void epson_blt_start(J720Display *d)
     case 0xc: /* solid fill */
         for (y = 0; y < h; y++) {
             for (x = 0; x < w; x++) {
-                *epson_px(d, dst + y * stride + x * 2) = fgc;
+                *epson_px_w(d, dst + y * stride + x * 2) = fgc;
             }
         }
         break;
@@ -913,6 +960,9 @@ static void jornada720_init(MachineState *machine)
     jms->display.blt_op = -1;
     memory_region_init_ram(&jms->display.fb, NULL, "j720.epson-fb",
                            J720_EPSON_FB_SIZE, &error_fatal);
+    memory_region_set_log(&jms->display.fb, true, DIRTY_MEMORY_VGA);
+    jms->display.blt_dirty_lo = INT_MAX;
+    jms->display.blt_dirty_hi = -1;
     memory_region_add_subregion(get_system_memory(), J720_EPSON_FB_BASE,
                                 &jms->display.fb);
     memory_region_init_io(&jms->display.regs, NULL, &j720_epson_regs_ops,

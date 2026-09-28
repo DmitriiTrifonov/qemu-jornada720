@@ -8,6 +8,7 @@
 # (--realtime and --vnc can be combined, in that order)
 #
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
+# Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
 # -icount is required (see docs/research.md). With the default shift=6
 # the CE clock runs roughly 12x faster than real time, because CE keeps
 # the CPU busy even when it looks idle; shift=auto keeps it in sync.
