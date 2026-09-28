@@ -158,9 +158,13 @@ static const MemoryRegionOps j720_pm_posr_stub_ops = {
  * switches GPIO9 to rising edge after the first touch), GPIO10 low = MCU
  * ready (always, here).
  *
- * The battery answer (GETBATTERYDATA) is a guess: 3 bytes, main and
- * backup battery 10-bit readings, low bytes then a byte of high bits
- * (same packing as the touch samples).
+ * GETBATTERYDATA answers 3 bytes: main and backup battery 10-bit ADC
+ * readings, low bytes, then a byte with main bits 9:8 in bits 1:0 and
+ * backup bits 9:8 in bits 3:2 (as battdrv.dll unpacks them).
+ * battdrv.dll: main < 512 is 0%, >= 665 is 100% (~12.3 mV per count, a
+ * 7.4 V pack); backup > 899 is "high", > 884 "low", > 527 "critical"
+ * (explorer.exe then nags "Backup Battery Very Low"), below that "no
+ * battery". Report both as full.
  */
 #define J720_MCU_TXDUMMY          0x11
 #define J720_MCU_GETBATTERYDATA   0xc0
@@ -175,6 +179,8 @@ static const MemoryRegionOps j720_pm_posr_stub_ops = {
 #define J720_GPIO_TS_IRQ    9
 
 #define J720_MCU_KEYQ       16
+#define J720_MCU_BATT_MAIN   0x2a0
+#define J720_MCU_BATT_BACKUP 0x3c0
 #define J720_MCU_TS_PERIOD_MS 10
 /*
  * Under -icount a quick finger tap can be over before CE has read a
@@ -295,9 +301,10 @@ static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
         j720_mcu_put(s, j720_mcu_high_bits(s->pen_y));
         break;
     case J720_MCU_GETBATTERYDATA:
-        j720_mcu_put(s, 0x00);          /* main battery, low byte */
-        j720_mcu_put(s, 0x00);          /* backup battery, low byte */
-        j720_mcu_put(s, 0x0f);          /* high bits: both 0x300 */
+        j720_mcu_put(s, J720_MCU_BATT_MAIN & 0xff);
+        j720_mcu_put(s, J720_MCU_BATT_BACKUP & 0xff);
+        j720_mcu_put(s, (J720_MCU_BATT_MAIN >> 8 & 3) |
+                        (J720_MCU_BATT_BACKUP >> 8 & 3) << 2);
         break;
     case J720_MCU_GETCONTRAST:
         j720_mcu_put(s, s->contrast);
