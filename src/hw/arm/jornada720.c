@@ -6,11 +6,16 @@
  * docs/plan.md / docs/research.md in the qemu-jornada720 project repo.
  *
  * Memory map (from Jornada 720 hardware docs):
- *   0x00000000  system Flash/ROM, 32 MiB   (SA_CS0)
- *   0x40000000  SA-1111 companion chip     (SA_CS4)  -- not emulated yet
- *   0x48000000  Epson display controller   -- not emulated yet
- *   0x48200000  Epson frame buffer, 512 KiB -- not emulated yet
- *   0xC0000000  system SDRAM, 32 MiB       (SA_SDCS0)
+ *   0x00000000  system Flash/ROM, 32 MiB    (SA_CS0)
+ *   0x1a000000  debug board CL-CD1284 UART  -- unimplemented-device stub
+ *   0x40000000  SA-1111 companion chip      (SA_CS4) -- unimplemented-device stub
+ *   0x48000000  Epson display controller    -- unimplemented-device stub
+ *   0x48200000  Epson frame buffer, 512 KiB -- unimplemented-device stub
+ *   0xC0000000  system SDRAM, 32 MiB        (SA_SDCS0)
+ *
+ * The stubs exist so boot-code probes of this not-yet-emulated hardware
+ * are visible via -d unimp instead of silently spinning forever; see
+ * jornada720_init().
  *
  * Step 1 goal (see docs/plan.md): boot far enough to see loader/CE output
  * on the on-chip UART. No display, no SA-1111, no input yet.
@@ -22,9 +27,19 @@
 #include "hw/core/boards.h"
 #include "strongarm.h"
 #include "hw/block/flash.h"
+#include "hw/misc/unimp.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 #include "qemu/error-report.h"
+
+#define J720_SA1111_BASE        0x40000000
+#define J720_SA1111_SIZE        (16 * MiB)
+#define J720_DEBUGBOARD_BASE    0x1a000000
+#define J720_DEBUGBOARD_SIZE    (1 * MiB)
+#define J720_EPSON_REGS_BASE    0x48000000
+#define J720_EPSON_REGS_SIZE    (2 * MiB)
+#define J720_EPSON_FB_BASE      0x48200000
+#define J720_EPSON_FB_SIZE      (512 * KiB)
 
 #define J720_RAM_SIZE          (32 * MiB)
 #define J720_FLASH_SIZE        (32 * MiB)
@@ -60,6 +75,23 @@ static void jornada720_init(MachineState *machine)
     pflash_cfi01_register(SA_CS0, "jornada720.rom", J720_FLASH_SIZE,
                            dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
                            J720_FLASH_SECTOR_SIZE, 4, 0x00, 0x00, 0x00, 0x00, 0);
+
+    /*
+     * Stubs so boot-code probes of not-yet-emulated hardware show up in
+     * -d unimp logs (address, size, read/write) instead of either silently
+     * reading -1 forever (ignore_memory_transaction_failures=true) or
+     * raising a real Data Abort the ROM's exception handling can't yet
+     * deal with (=false). This is how real unpopulated chip-select space
+     * behaves anyway: reads something, doesn't fault the bus.
+     */
+    create_unimplemented_device("j720.sa1111", J720_SA1111_BASE,
+                                 J720_SA1111_SIZE);
+    create_unimplemented_device("j720.debugboard", J720_DEBUGBOARD_BASE,
+                                 J720_DEBUGBOARD_SIZE);
+    create_unimplemented_device("j720.epson-regs", J720_EPSON_REGS_BASE,
+                                 J720_EPSON_REGS_SIZE);
+    create_unimplemented_device("j720.epson-fb", J720_EPSON_FB_BASE,
+                                 J720_EPSON_FB_SIZE);
 
     /*
      * No arm_load_kernel() call here on purpose: we are not booting a

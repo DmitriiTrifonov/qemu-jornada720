@@ -11,5 +11,14 @@
 см. `docs/plan.md`):
 
 ```
-cd qemu-src && git apply ../patches/0001-wire-up-jornada720-machine.patch
+cd qemu-src
+git apply ../patches/0001-wire-up-jornada720-machine.patch
+git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
 ```
+
+- `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
+- `0002-...` — правка `target/arm/helper.c`: добавляет SA-1110-специфичный
+  регистр CP15 `c1,c1,0` (Auxiliary Control Register) как RAZ/WI в таблицу
+  `strongarm_cp_reginfo`. Без этого реальный ROM Jornada 720 падает в
+  Undefined Instruction на первых же сотнях инструкций загрузки (см.
+  `docs/research.md`, раздел "Прогон реального ROM").

@@ -1,0 +1,21 @@
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index c3f607e..adfc3ab 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -3043,6 +3043,16 @@ static const ARMCPRegInfo strongarm_cp_reginfo[] = {
+       .crm = CP_ANY, .opc1 = CP_ANY, .opc2 = CP_ANY,
+       .access = PL1_RW, .resetvalue = 0,
+       .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
++    /*
++     * SA-1110-specific Auxiliary Control Register (c1,c1,0). Not modeled;
++     * real Jornada 720 ROM code writes it during early boot and expects it
++     * to succeed. Local experiment for the qemu-jornada720 project, not
++     * verified against the SA-1110 datasheet beyond "don't UNDEF here".
++     */
++    { .name = "C1_SA1110_AUX", .cp = 15, .crn = 1,
++      .crm = 1, .opc1 = 0, .opc2 = 0,
++      .access = PL1_RW, .resetvalue = 0,
++      .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
+ };
+ 
+ static uint64_t midr_read(CPUARMState *env, const ARMCPRegInfo *ri)
