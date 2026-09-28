@@ -1,0 +1,28 @@
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index e76ee90..a1532ee 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -3053,6 +3053,23 @@ static const ARMCPRegInfo strongarm_cp_reginfo[] = {
+       .crm = 1, .opc1 = 0, .opc2 = 0,
+       .access = PL1_RW, .resetvalue = 0,
+       .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
++    /*
++     * StrongARM power management (c15): enable/disable clock switching
++     * (c15,c1,2 / c15,c2,2) are no-ops here, and c15,c8,2 is "wait for
++     * interrupt" -- the Jornada 720 CE kernel idles with it. Without it
++     * the idle loop spins, burning host CPU and (under -icount) running
++     * guest time far ahead of real time. Local experiment for the
++     * qemu-jornada720 project.
++     */
++    { .name = "C15_SA_CLKSW_EN", .cp = 15, .crn = 15,
++      .crm = 1, .opc1 = 0, .opc2 = 2,
++      .access = PL1_W, .type = ARM_CP_NOP | ARM_CP_OVERRIDE },
++    { .name = "C15_SA_CLKSW_DIS", .cp = 15, .crn = 15,
++      .crm = 2, .opc1 = 0, .opc2 = 2,
++      .access = PL1_W, .type = ARM_CP_NOP | ARM_CP_OVERRIDE },
++    { .name = "C15_SA_WFI", .cp = 15, .crn = 15,
++      .crm = 8, .opc1 = 0, .opc2 = 2,
++      .access = PL1_W, .type = ARM_CP_WFI | ARM_CP_OVERRIDE },
+ };
+ 
+ static uint64_t midr_read(CPUARMState *env, const ARMCPRegInfo *ri)

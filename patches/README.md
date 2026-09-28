@@ -19,6 +19,7 @@ git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
 git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
 git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
 git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
+git apply ../patches/0008-sa1110-c15-idle-wfi.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -60,3 +61,7 @@ git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
   левому верхнему углу. Теперь при заданном логическом размере координаты
   не пересчитываются. Сборка с SDL: `meson setup --reconfigure build
   qemu-src -Dsdl=enabled` (нужен `sdl2-dev`).
+- `0008-...` — правка `target/arm/helper.c` (после `0002` и `0004`): для
+  StrongARM `c15,c8,2` — ждать прерывания (WFI), `c15,c1,2`/`c15,c2,2`
+  (переключение тактов) — пустые операции. Так ядро CE уходит в простой.
+  Заметного эффекта пока нет: CE и «в простое» постоянно чем-то занят.

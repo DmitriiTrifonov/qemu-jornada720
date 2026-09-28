@@ -1,12 +1,16 @@
 #!/bin/sh
 # Start the HP Jornada 720 emulator in an SDL window.
 #
-#   ./run.sh              window (SDL)
+#   ./run.sh              window (SDL), fast boot (~25 s to the desktop)
+#   ./run.sh --realtime   guest clock runs at real speed, boot ~50 s
 #   ./run.sh --vnc        no window, VNC on localhost:5900
 #   ./run.sh -- <args>    pass extra arguments to QEMU
+# (--realtime and --vnc can be combined, in that order)
 #
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
-# Boot takes a few minutes; -icount is required (see docs/research.md).
+# -icount is required (see docs/research.md). With the default shift=6
+# the CE clock runs roughly 12x faster than real time, because CE keeps
+# the CPU busy even when it looks idle; shift=auto keeps it in sync.
 set -e
 
 cd "$(dirname "$0")"
@@ -17,6 +21,12 @@ ROM=roms/jornada720.bin
 [ -x "$QEMU" ] || { echo "no $QEMU, build it first: ninja -C build qemu-system-arm" >&2; exit 1; }
 [ -f "$ROM" ] || { echo "no ROM image at $ROM" >&2; exit 1; }
 
+icount="shift=6,align=off"
+if [ "$1" = "--realtime" ]; then
+    icount="shift=auto,align=off"
+    shift
+fi
+
 display="-display sdl"
 case "$1" in
     --vnc) display="-display none -vnc 127.0.0.1:0"; shift ;;
@@ -25,5 +35,5 @@ esac
 
 exec "$QEMU" -M jornada720 \
     -drive if=pflash,format=raw,file="$ROM" \
-    -icount shift=3,align=off \
+    -icount "$icount" \
     $display "$@"
