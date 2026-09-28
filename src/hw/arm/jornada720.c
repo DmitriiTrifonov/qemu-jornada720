@@ -45,6 +45,50 @@
 #define J720_FLASH_SIZE        (32 * MiB)
 #define J720_FLASH_SECTOR_SIZE (64 * KiB)
 
+/*
+ * SA-1111 SSP block base is 0x0800 (confirmed against the real Linux
+ * driver's device table, arch/arm/common/sa1111.c -- NOT the 0x1600/0x1800
+ * values naively guessable from the simplified asm/hardware/sa1111.h
+ * register-name header, which turned out to be for INTC/PCMCIA instead).
+ * Boot code spins forever reading offset 0x10 within this block (SA-1111
+ * base + 0x810), almost certainly the SSP Status Register polling a
+ * "FIFO not full" / "not busy" flag. Not implementing real SSP semantics,
+ * just returning all-1s so whatever bit is polled reads as set. See
+ * docs/research.md for how this was narrowed down.
+ */
+#define J720_SA1111_SSP_STUB_BASE (J720_SA1111_BASE + 0x800)
+#define J720_SA1111_SSP_STUB_SIZE 0x1000
+
+static uint64_t j720_ssp_stub_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /*
+     * Guessing the SA-1111 SSP status register shares its bit layout with
+     * the on-chip SA-1110 SSP (strongarm_ssp in this same tree): TNF=bit2,
+     * RNE=bit3, TFS=bit5, RFS=bit6, ROR=bit7 (left clear). An all-1s stub
+     * unblocked the first poll but then hung a second one -- consistent
+     * with the boot code also waiting for a busy/overrun-style bit to
+     * read 0, which all-1s can never satisfy. Experimental, unconfirmed
+     * against the real SA-1111 datasheet chapter 8 (bitsavers copy is a
+     * dead link; see docs/research.md).
+     */
+    return (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6);
+}
+
+static void j720_ssp_stub_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+}
+
+static const MemoryRegionOps j720_ssp_stub_ops = {
+    .read = j720_ssp_stub_read,
+    .write = j720_ssp_stub_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 struct Jornada720MachineState {
     MachineState parent;
 
@@ -92,6 +136,16 @@ static void jornada720_init(MachineState *machine)
                                  J720_EPSON_REGS_SIZE);
     create_unimplemented_device("j720.epson-fb", J720_EPSON_FB_BASE,
                                  J720_EPSON_FB_SIZE);
+
+    {
+        MemoryRegion *ssp_stub = g_new(MemoryRegion, 1);
+        memory_region_init_io(ssp_stub, NULL, &j720_ssp_stub_ops, NULL,
+                               "j720.sa1111-ssp-stub",
+                               J720_SA1111_SSP_STUB_SIZE);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                             J720_SA1111_SSP_STUB_BASE,
+                                             ssp_stub, 1);
+    }
 
     /*
      * No arm_load_kernel() call here on purpose: we are not booting a
