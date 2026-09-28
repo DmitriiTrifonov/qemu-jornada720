@@ -91,6 +91,49 @@ static const MemoryRegionOps j720_ssp_stub_ops = {
 };
 
 /*
+ * SA-1110 on-chip Power Manager block, 0x90020000 -- entirely missing from
+ * hw/arm/strongarm.c (confirmed: no reference to it anywhere in that file).
+ * Found by tracing where the ROM's OAL-style delay/poll loop (two
+ * back-to-back ~100ms stalls, then re-check) reads its status word from:
+ * the kernel's uncached alias 0xa3420000 resolves (via the page table
+ * built at this point in boot, TTBR0 read live through the QEMU gdbstub)
+ * to physical section base 0x90020000, and the polled word is at offset
+ * 0x1c within it. Matches the real SA-1110 Power Manager register map
+ * (PMCR=0x00, PSSR=0x04, PSPR=0x08, PWER=0x0c, PCFR=0x10, PPCR=0x14,
+ * PGSR=0x18, POSR=0x1c) -- offset 0x1c is POSR, the Oscillator Status
+ * Register, bit0 = "3.6864 MHz oscillator stable". Real hardware sets
+ * this shortly after reset; our emulation never did, so the boot code's
+ * "wait for oscillator" loop spun forever. Only bit0 of POSR is modeled;
+ * everything else in this block still falls through to the
+ * unimplemented-device stub below, so any further probes stay visible
+ * via -d unimp. See docs/research.md.
+ */
+#define J720_SA1110_PM_BASE 0x90020000
+#define J720_SA1110_PM_SIZE (4 * KiB)
+#define J720_SA1110_PM_POSR_OFFSET 0x1c
+#define J720_SA1110_PM_POSR_BASE (J720_SA1110_PM_BASE + J720_SA1110_PM_POSR_OFFSET)
+
+static uint64_t j720_pm_posr_stub_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 1; /* POSR bit0 (OOK): oscillator stable */
+}
+
+static void j720_pm_stub_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+}
+
+static const MemoryRegionOps j720_pm_posr_stub_ops = {
+    .read = j720_pm_posr_stub_read,
+    .write = j720_pm_stub_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/*
  * Nothing is wired up on the on-chip SSP's SSI bus (jms->sa1110->ssp_bus).
  * Boot code was found (via QEMU monitor: PC=0x4f26c, R02=0x480001fc,
  * R04/R05 = on-chip SSDR/SSSR, R06 = on-chip GPIO) to be bit-banging data
@@ -180,6 +223,8 @@ static void jornada720_init(MachineState *machine)
                                  J720_EPSON_REGS_SIZE);
     create_unimplemented_device("j720.epson-fb", J720_EPSON_FB_BASE,
                                  J720_EPSON_FB_SIZE);
+    create_unimplemented_device("j720.sa1110-pm", J720_SA1110_PM_BASE,
+                                 J720_SA1110_PM_SIZE);
 
     {
         MemoryRegion *ssp_stub = g_new(MemoryRegion, 1);
@@ -189,6 +234,15 @@ static void jornada720_init(MachineState *machine)
         memory_region_add_subregion_overlap(get_system_memory(),
                                              J720_SA1111_SSP_STUB_BASE,
                                              ssp_stub, 1);
+    }
+
+    {
+        MemoryRegion *pm_posr_stub = g_new(MemoryRegion, 1);
+        memory_region_init_io(pm_posr_stub, NULL, &j720_pm_posr_stub_ops, NULL,
+                               "j720.sa1110-pm-posr-stub", 4);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                                             J720_SA1110_PM_POSR_BASE,
+                                             pm_posr_stub, 1);
     }
 
     ssi_create_peripheral(jms->sa1110->ssp_bus, TYPE_J720_SSI_STUB);

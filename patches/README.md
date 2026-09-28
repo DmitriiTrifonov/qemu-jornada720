@@ -15,6 +15,7 @@ cd qemu-src
 git apply ../patches/0001-wire-up-jornada720-machine.patch
 git apply ../patches/0002-sa1110-aux-control-register-dummy.patch
 git apply ../patches/0003-fix-sssr-bit-positions.patch
+git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -31,3 +32,9 @@ git apply ../patches/0003-fix-sssr-bit-positions.patch
   Затрагивает общий код, используемый и другими платами (например
   `collie`) — потенциально более правильно для всех них, но не проверено
   на регрессии.
+- `0004-...` — правка `target/arm/helper.c` (применять после `0002`, тот же
+  файл): для `ARM_FEATURE_STRONGARM` ставит `ARM_CP_SUPPRESS_TB_END` на запись
+  SCTLR, чтобы инструкция сразу после включения MMU ещё исполнялась по старому
+  отображению (классическая идиома MMU-enable, на которую полагается ROM).
+  Без этого — Prefetch Abort сразу после включения MMU (см. `docs/research.md`,
+  разделы про MMU-enable). Не проверено на регрессии для `collie`.

@@ -1,0 +1,34 @@
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index c3f607e..e76ee90 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -7577,6 +7587,29 @@ void register_cp_regs_for_features(ARMCPU *cpu)
+             .writefn = sctlr_write, .resetvalue = cpu->reset_sctlr,
+             .raw_writefn = raw_write,
+         };
++        if (arm_feature(env, ARM_FEATURE_STRONGARM)) {
++            /*
++             * Local experiment for the qemu-jornada720 project (not
++             * verified against real SA-1110 hardware beyond this one ROM):
++             * real boot code on this CPU enables the MMU via this register
++             * and, as its very next instruction, branches to the same code
++             * through a different (mapped) virtual alias -- relying on
++             * that next instruction still executing under the pre-write
++             * translation, per the classic ARM "MMU-enable" idiom (compare
++             * Linux arch/arm/kernel/head.S). QEMU's default behaviour ends
++             * the translation block and rebuilds hflags immediately after
++             * any cp15 write, so that next instruction fetch already uses
++             * the new (post-enable) translation -- which faults here,
++             * since only the branch target's alias is mapped yet. Real
++             * SA-1110 silicon apparently tolerates this; not verified
++             * against the datasheet. Suppressing the forced TB end lets
++             * translation continue into the following (already-decoded)
++             * branch instruction using the old mapping, matching observed
++             * real-hardware behaviour. Not verified for regressions on
++             * other strongarm-based boards/guests (e.g. collie).
++             */
++            sctlr.type |= ARM_CP_SUPPRESS_TB_END;
++        }
+         define_one_arm_cp_reg(cpu, &sctlr);
+ 
+         if (arm_feature(env, ARM_FEATURE_PMSA) &&
