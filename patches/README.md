@@ -18,6 +18,7 @@ git apply ../patches/0003-fix-sssr-bit-positions.patch
 git apply ../patches/0004-strongarm-sctlr-suppress-tb-end.patch
 git apply ../patches/0005-strongarm-nv-condition-is-nop.patch
 git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
+git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -52,3 +53,10 @@ git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
   (`jornada720_ssp.c`) пишут в SSDR `byte << 8`; без правки QEMU обрезал это
   до нуля, и MCU клавиатуры/тачскрина ничего не получал. По мануалу SA-1110
   не сверено (bitsavers был недоступен). Не проверено на регрессии для `collie`.
+- `0007-...` — правка `ui/sdl2.c`: SDL2-рендер задаёт логический размер
+  (`SDL_RenderSetLogicalSize`), и SDL уже сам переводит координаты мыши и
+  касаний в логические. QEMU масштабировал их повторно по размеру окна, и
+  в окне больше экрана гостя (на весь экран телефона) касания съезжали к
+  левому верхнему углу. Теперь при заданном логическом размере координаты
+  не пересчитываются. Сборка с SDL: `meson setup --reconfigure build
+  qemu-src -Dsdl=enabled` (нужен `sdl2-dev`).

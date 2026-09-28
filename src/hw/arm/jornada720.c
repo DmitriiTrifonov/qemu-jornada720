@@ -176,6 +176,11 @@ static const MemoryRegionOps j720_pm_posr_stub_ops = {
 
 #define J720_MCU_KEYQ       16
 #define J720_MCU_TS_PERIOD_MS 10
+/*
+ * Under -icount a quick finger tap can be over before CE has read a
+ * single sample; keep the pen down until it has read this many.
+ */
+#define J720_MCU_TS_MIN_SAMPLES 3
 
 static const unsigned short j720_keymap[128] = {					/* ROW */
 	0, KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,		/* #1  */
@@ -214,6 +219,8 @@ struct J720MCUState {
     int keyq_len;
 
     bool pen_down;
+    bool pen_up_pending;        /* released before enough samples were read */
+    int pen_samples;            /* GETTOUCHSAMPLES answered since pen down */
     int pen_x, pen_y;           /* 10-bit ADC values */
     QEMUTimer *ts_timer;        /* sample pulses on GPIO9 while pen down */
 };
@@ -279,6 +286,7 @@ static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
         qemu_irq_raise(s->kbd_irq);
         break;
     case J720_MCU_GETTOUCHSAMPLES:
+        s->pen_samples++;
         j720_mcu_put_samples(s, s->pen_x & 0xff, s->pen_x & 0xff,
                              s->pen_x & 0xff);
         j720_mcu_put_samples(s, s->pen_y & 0xff, s->pen_y & 0xff,
@@ -337,6 +345,30 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
     qemu_irq_lower(s->kbd_irq);
 }
 
+static void j720_mcu_pen_up(J720MCUState *s)
+{
+    s->pen_down = false;
+    s->pen_up_pending = false;
+    qemu_irq_raise(s->ts_irq);
+    timer_del(s->ts_timer);
+}
+
+static void j720_mcu_ts_tick(void *opaque)
+{
+    J720MCUState *s = opaque;
+
+    if (s->pen_up_pending && s->pen_samples >= J720_MCU_TS_MIN_SAMPLES) {
+        j720_mcu_pen_up(s);
+        return;
+    }
+    if (s->pen_down) {
+        qemu_irq_raise(s->ts_irq);
+        qemu_irq_lower(s->ts_irq);
+        timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_TS_PERIOD_MS);
+    }
+}
+
 static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
                                    QemuInputEvent *evt)
 {
@@ -346,7 +378,10 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
     case INPUT_EVENT_KIND_ABS: {
         InputMoveEvent *move = &evt->abs;
         /* map the whole screen onto most of the 10-bit ADC range */
-        int v = qemu_input_scale_axis(move->value, INPUT_EVENT_ABS_MIN,
+        int v = qemu_input_scale_axis(MIN(MAX(move->value,
+                                                  INPUT_EVENT_ABS_MIN),
+                                              INPUT_EVENT_ABS_MAX),
+                                      INPUT_EVENT_ABS_MIN,
                                       INPUT_EVENT_ABS_MAX, 64, 960);
         if (move->axis == INPUT_AXIS_X) {
             s->pen_x = v;
@@ -357,33 +392,25 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
     }
     case INPUT_EVENT_KIND_BTN: {
         InputBtnEvent *btn = &evt->btn;
-        if (btn->button == INPUT_BUTTON_LEFT) {
-            s->pen_down = btn->down;
-            qemu_set_irq(s->ts_irq, !s->pen_down);
-            if (s->pen_down) {
-                timer_mod(s->ts_timer,
-                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                          J720_MCU_TS_PERIOD_MS);
-            } else {
-                timer_del(s->ts_timer);
-            }
+        if (btn->button != INPUT_BUTTON_LEFT) {
+            break;
+        }
+        if (btn->down) {
+            s->pen_down = true;
+            s->pen_up_pending = false;
+            s->pen_samples = 0;
+            qemu_irq_lower(s->ts_irq);
+            timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      J720_MCU_TS_PERIOD_MS);
+        } else if (s->pen_samples < J720_MCU_TS_MIN_SAMPLES) {
+            s->pen_up_pending = true;
+        } else {
+            j720_mcu_pen_up(s);
         }
         break;
     }
     default:
         break;
-    }
-}
-
-static void j720_mcu_ts_tick(void *opaque)
-{
-    J720MCUState *s = opaque;
-
-    if (s->pen_down) {
-        qemu_irq_raise(s->ts_irq);
-        qemu_irq_lower(s->ts_irq);
-        timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                  J720_MCU_TS_PERIOD_MS);
     }
 }
 

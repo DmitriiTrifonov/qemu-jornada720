@@ -1,0 +1,67 @@
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 1c97d23..f55ba10 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -495,6 +495,24 @@ static void handle_textinput(SDL_Event *ev)
+     }
+ }
+ 
++/*
++ * Local experiment for the qemu-jornada720 project: the 2D renderer sets
++ * SDL_RenderSetLogicalSize() to the guest surface size, and SDL2 then
++ * already delivers mouse (and touch-synthesised mouse) coordinates in
++ * that logical space, letterboxing included. Scaling them again by the
++ * window size squashes them towards the top-left corner as soon as the
++ * window is bigger than the guest screen (e.g. fullscreen on a phone).
++ */
++static bool sdl2_coords_are_logical(struct sdl2_console *scon)
++{
++    int lw = 0, lh = 0;
++
++    if (scon->real_renderer) {
++        SDL_RenderGetLogicalSize(scon->real_renderer, &lw, &lh);
++    }
++    return lw > 0 && lh > 0;
++}
++
+ static void handle_mousemotion(SDL_Event *ev)
+ {
+     int max_x, max_y;
+@@ -522,10 +540,17 @@ static void handle_mousemotion(SDL_Event *ev)
+     }
+     surf_w = surface_width(scon->surface);
+     surf_h = surface_height(scon->surface);
+-    x = (int64_t)ev->motion.x * surf_w / scr_w;
+-    y = (int64_t)ev->motion.y * surf_h / scr_h;
+-    dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
+-    dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
++    if (sdl2_coords_are_logical(scon)) {
++        x = ev->motion.x;
++        y = ev->motion.y;
++        dx = ev->motion.xrel;
++        dy = ev->motion.yrel;
++    } else {
++        x = (int64_t)ev->motion.x * surf_w / scr_w;
++        y = (int64_t)ev->motion.y * surf_h / scr_h;
++        dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
++        dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
++    }
+     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
+         sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state);
+     }
+@@ -544,8 +569,13 @@ static void handle_mousebutton(SDL_Event *ev)
+ 
+     bev = &ev->button;
+     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+-    x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
+-    y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
++    if (sdl2_coords_are_logical(scon)) {
++        x = bev->x;
++        y = bev->y;
++    } else {
++        x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
++        y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
++    }
+ 
+     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
+         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
