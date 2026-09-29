@@ -23,10 +23,11 @@
 # /files/, the host folder ~/jornada-files (or $J720_FILES) for
 # downloading into CE. Its log: $STATE_DIR/frogfind.log.
 #
-# The window scales the 640x240 screen by whole factors only (sharp, may
-# leave borders). QEMU_SDL_SCALE=sharp fills the window almost as crisply
-# ("sharp bilinear"), =linear fills it smoothed, =nearest is QEMU's old
-# uneven scaling. All but nearest draw at the screen's full resolution.
+# The window is filled with the 640x240 screen scaled "sharp bilinear"
+# (nearest by a whole factor, then linear for the rest).
+# QEMU_SDL_SCALE=integer keeps whole factors only (crisp, with borders),
+# =linear smooths, =nearest is QEMU's old uneven scaling. All but nearest
+# draw at the screen's full resolution.
 #
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
@@ -62,7 +63,7 @@ while [ $# -gt 0 ]; do
 done
 
 mkdir -p "$STATE_DIR"
-QEMU_SDL_SCALE=${QEMU_SDL_SCALE:-integer}
+QEMU_SDL_SCALE=${QEMU_SDL_SCALE:-sharp}
 export QEMU_SDL_SCALE
 
 # Web server for CE (see the top): FrogFind, if installed, and /files/.
