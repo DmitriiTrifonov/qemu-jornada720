@@ -303,6 +303,9 @@ static bool j720_wake_on_input(bool press)
 #define J720_MCU_KEYQ_USE   (J720_MCU_KEYQ - 1)
 #define J720_MCU_PEND       64
 #define J720_MCU_PEND_RAW   0x80000000u
+#define J720_MCU_PEND_PRESS 0x40000000u     /* make + break, never split */
+/* re-signal GPIO0 if CE has not read waiting codes after this long */
+#define J720_MCU_KBD_WATCHDOG_MS 50
 #define J720_MCU_KBD_DELAY_MS 5
 #define J720_MCU_BATT_MAIN   0x2a0
 #define J720_MCU_BATT_BACKUP 0x3c0
@@ -358,7 +361,8 @@ struct J720MCUState {
      */
     uint32_t pend[J720_MCU_PEND];
     int pend_head, pend_len;
-    QEMUTimer *kbd_timer;       /* hands out pend a little after a read */
+    QEMUTimer *kbd_timer;       /* pend after a read; GPIO0 watchdog */
+    bool kbd_line_low;          /* GPIO0 low: codes waiting in keyq */
 
     bool pen_down;
     bool pen_up_pending;        /* released before enough samples were read */
@@ -431,6 +435,7 @@ static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
         }
         s->keyq_len = 0;
         qemu_irq_raise(s->kbd_irq);
+        s->kbd_line_low = false;
         /*
          * Not right away: CE acknowledges the GPIO0 edge after reading,
          * which would swallow one made during the read.
@@ -438,6 +443,8 @@ static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
         if (s->pend_len) {
             timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                       J720_MCU_KBD_DELAY_MS);
+        } else {
+            timer_del(s->kbd_timer);
         }
         break;
     case J720_MCU_GETTOUCHSAMPLES:
@@ -550,6 +557,10 @@ static void j720_mcu_drain(J720MCUState *s)
         if (e & J720_MCU_PEND_RAW) {
             seq[0] = e;
             n = 1;
+        } else if (e & J720_MCU_PEND_PRESS) {
+            seq[0] = e;
+            seq[1] = (e & 0x7f) | 0x80;
+            n = 2;
         } else if (e > 99999) {
             n = 0;                          /* CE takes at most 5 digits */
         } else {
@@ -566,6 +577,9 @@ static void j720_mcu_drain(J720MCUState *s)
     }
     if (added) {
         qemu_irq_lower(s->kbd_irq);
+        s->kbd_line_low = true;
+        timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_KBD_WATCHDOG_MS);
     }
 }
 
@@ -575,15 +589,35 @@ static bool j720_mcu_pend(J720MCUState *s, uint32_t e)
         return false;
     }
     s->pend[(s->pend_head + s->pend_len++) % J720_MCU_PEND] = e;
-    if (!timer_pending(s->kbd_timer)) {
+    if (!timer_pending(s->kbd_timer) || s->kbd_line_low) {
         j720_mcu_drain(s);
     }
     return true;
 }
 
+/*
+ * After a read: hand out more codes. While codes wait unread: CE may have
+ * acknowledged the GPIO0 edge without reading (a key make stuck without
+ * its break then leaves a button pressed in CE), so raise the line and
+ * drop it again for a fresh edge.
+ */
 static void j720_mcu_kbd_tick(void *opaque)
 {
-    j720_mcu_drain(opaque);
+    J720MCUState *s = opaque;
+
+    if (!s->keyq_len) {
+        j720_mcu_drain(s);
+    } else if (s->kbd_line_low) {
+        qemu_irq_raise(s->kbd_irq);
+        s->kbd_line_low = false;
+        timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_KBD_DELAY_MS);
+    } else {
+        qemu_irq_lower(s->kbd_irq);
+        s->kbd_line_low = true;
+        timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_KBD_WATCHDOG_MS);
+    }
 }
 
 static bool j720_mcu_key_queue(J720MCUState *s, uint8_t b)
@@ -642,9 +676,8 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
         }
         break;
     default:
-        if (down && s->pend_len + 2 <= J720_MCU_PEND) {
-            j720_mcu_key_queue(s, code);
-            j720_mcu_key_queue(s, code | 0x80);
+        if (down) {
+            j720_mcu_pend(s, J720_MCU_PEND_PRESS | code);
         }
         break;
     }
@@ -775,6 +808,12 @@ static int j720_mcu_post_load(void *opaque, int version_id)
         s->out_pos < 0 || s->out_pos > s->out_len ||
         s->keyq_len < 0 || s->keyq_len > J720_MCU_KEYQ) {
         return -EINVAL;
+    }
+    /* codes left unread (possibly stuck, see j720_mcu_kbd_tick) */
+    s->kbd_line_low = s->keyq_len > 0;
+    if (s->kbd_line_low) {
+        timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_KBD_WATCHDOG_MS);
     }
     return 0;
 }
