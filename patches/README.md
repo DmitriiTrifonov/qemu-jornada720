@@ -21,6 +21,7 @@ git apply ../patches/0006-sa1110-ssp-msb-justified-tx.patch
 git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
 git apply ../patches/0008-sa1110-c15-idle-wfi.patch
 git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
+git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -73,3 +74,6 @@ git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
   закрыть. Плюс Ctrl+Alt+Q — выход, как в GTK-интерфейсе QEMU.
   Ctrl и Alt годятся с любой стороны: у Bluetooth-клавиатуры пользователя
   единственный Alt отдаёт код RightAlt, и LCtrl+LAlt не срабатывал.
+- `0010-...` — правка `ui/sdl2.c` (после `0009`): закрытие окна больше не
+  переключает `-action shutdown` на poweroff. Иначе `run.sh` не успевал
+  сохранить машину: QEMU выходил, не встав на паузу.

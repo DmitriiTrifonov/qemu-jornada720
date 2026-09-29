@@ -36,6 +36,7 @@
 #include "ui/surface.h"
 #include "ui/input.h"
 #include "hw/core/irq.h"
+#include "migration/vmstate.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -462,12 +463,51 @@ static void j720_mcu_realize(SSIPeripheral *dev, Error **errp)
     qemu_input_handler_activate(hs);
 }
 
+static int j720_mcu_post_load(void *opaque, int version_id)
+{
+    J720MCUState *s = opaque;
+
+    if (s->out_len < 0 || s->out_len > (int)sizeof(s->out) ||
+        s->out_pos < 0 || s->out_pos > s->out_len ||
+        s->keyq_len < 0 || s->keyq_len > J720_MCU_KEYQ) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_j720_mcu = {
+    .name = TYPE_J720_MCU,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = j720_mcu_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_SSI_PERIPHERAL(parent_obj, J720MCUState),
+        VMSTATE_UINT8_ARRAY(out, J720MCUState, 16),
+        VMSTATE_INT32(out_len, J720MCUState),
+        VMSTATE_INT32(out_pos, J720MCUState),
+        VMSTATE_INT32(expect_data, J720MCUState),
+        VMSTATE_UINT8(contrast, J720MCUState),
+        VMSTATE_UINT8(brightness, J720MCUState),
+        VMSTATE_UINT8_ARRAY(keyq, J720MCUState, J720_MCU_KEYQ),
+        VMSTATE_INT32(keyq_len, J720MCUState),
+        VMSTATE_BOOL(pen_down, J720MCUState),
+        VMSTATE_BOOL(pen_up_pending, J720MCUState),
+        VMSTATE_INT32(pen_samples, J720MCUState),
+        VMSTATE_INT32(pen_x, J720MCUState),
+        VMSTATE_INT32(pen_y, J720MCUState),
+        VMSTATE_TIMER_PTR(ts_timer, J720MCUState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void j720_mcu_class_init(ObjectClass *klass, const void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(klass);
     SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
 
     k->realize = j720_mcu_realize;
     k->transfer = j720_mcu_transfer;
+    dc->vmsd = &vmstate_j720_mcu;
 }
 
 static const TypeInfo j720_mcu_typeinfo = {
@@ -895,15 +935,62 @@ static const MemoryRegionOps j720_udc_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+#define TYPE_JORNADA720_MACHINE MACHINE_TYPE_NAME("jornada720")
+OBJECT_DECLARE_SIMPLE_TYPE(Jornada720MachineState, JORNADA720_MACHINE)
+
 struct Jornada720MachineState {
     MachineState parent;
 
     StrongARMState *sa1110;
     J720Display display;
+    uint32_t udc_reg[J720_SA1110_UDC_SIZE / 4];
 };
 
-#define TYPE_JORNADA720_MACHINE MACHINE_TYPE_NAME("jornada720")
-OBJECT_DECLARE_SIMPLE_TYPE(Jornada720MachineState, JORNADA720_MACHINE)
+/*
+ * State of the board-level models above (the frame buffer RAM and the
+ * SA-1110 devices save themselves), so run.sh can suspend the machine
+ * to a file and resume it: CE keeps everything, registry included, in
+ * RAM, like the real battery-backed device.
+ */
+static int j720_display_post_load(void *opaque, int version_id)
+{
+    J720Display *d = opaque;
+
+    d->invalidate = true;
+    d->blt_dirty_lo = INT_MAX;
+    d->blt_dirty_hi = -1;
+    return 0;
+}
+
+static const VMStateDescription vmstate_j720_display = {
+    .name = "j720-epson",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = j720_display_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(reg, J720Display, J720_EPSON_NREGS),
+        VMSTATE_INT32(blt_op, J720Display),
+        VMSTATE_UINT32(blt_x, J720Display),
+        VMSTATE_UINT32(blt_y, J720Display),
+        VMSTATE_UINT32(blt_w, J720Display),
+        VMSTATE_UINT32(blt_h, J720Display),
+        VMSTATE_UINT32(blt_bit, J720Display),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_jornada720 = {
+    .name = "jornada720",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT(display, Jornada720MachineState, 1,
+                       vmstate_j720_display, J720Display),
+        VMSTATE_UINT32_ARRAY(udc_reg, Jornada720MachineState,
+                             J720_SA1110_UDC_SIZE / 4),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static void jornada720_init(MachineState *machine)
 {
@@ -954,8 +1041,7 @@ static void jornada720_init(MachineState *machine)
 
     {
         MemoryRegion *udc = g_new(MemoryRegion, 1);
-        memory_region_init_io(udc, NULL, &j720_udc_ops,
-                              g_new0(uint32_t, J720_SA1110_UDC_SIZE / 4),
+        memory_region_init_io(udc, NULL, &j720_udc_ops, jms->udc_reg,
                               "j720.sa1110-udc", J720_SA1110_UDC_SIZE);
         memory_region_add_subregion(get_system_memory(), J720_SA1110_UDC_BASE,
                                     udc);
@@ -994,6 +1080,7 @@ static void jornada720_init(MachineState *machine)
                                 &jms->display.regs);
     jms->display.con = qemu_graphic_console_create(NULL, 0, &j720_display_ops,
                                                    &jms->display);
+    vmstate_register(NULL, 0, &vmstate_jornada720, jms);
 
     /*
      * No arm_load_kernel() call here on purpose: we are not booting a

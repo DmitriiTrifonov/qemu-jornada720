@@ -1,0 +1,25 @@
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -695,7 +695,11 @@
+                 allow_close = false;
+             }
+             if (allow_close) {
+-                shutdown_action = SHUTDOWN_ACTION_POWEROFF;
++                /*
++                 * qemu-jornada720: no forced SHUTDOWN_ACTION_POWEROFF, so
++                 * -action shutdown=pause lets run.sh save the machine
++                 * first, as it does for Ctrl+Alt+Q.
++                 */
+                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+             }
+         } else {
+@@ -742,7 +746,7 @@
+                 allow_close = false;
+             }
+             if (allow_close) {
+-                shutdown_action = SHUTDOWN_ACTION_POWEROFF;
++                /* qemu-jornada720: see SDL_WINDOWEVENT_CLOSE */
+                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+             }
+             break;
