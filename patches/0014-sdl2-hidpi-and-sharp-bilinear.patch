@@ -1,0 +1,137 @@
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -32,6 +32,8 @@
+     DisplaySurface *surface;
+     DisplayOptions *opts;
+     SDL_Texture *texture;
++    SDL_Texture *sharp_target;  /* qemu-jornada720: QEMU_SDL_SCALE=sharp */
++    int sharp_factor;
+     SDL_Window *real_window;
+     SDL_Renderer *real_renderer;
+     int idx;
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -97,6 +97,10 @@
+     if (scon->hidden) {
+         flags |= SDL_WINDOW_HIDDEN;
+     }
++    if (getenv("QEMU_SDL_SCALE")) {
++        /* qemu-jornada720: scale at full resolution, see sdl2-2d.c */
++        flags |= SDL_WINDOW_ALLOW_HIGHDPI;
++    }
+ #ifdef CONFIG_OPENGL
+     if (scon->opengl) {
+         flags |= SDL_WINDOW_OPENGL;
+diff --git a/ui/sdl2-2d.c b/ui/sdl2-2d.c
+--- a/ui/sdl2-2d.c
++++ b/ui/sdl2-2d.c
+@@ -28,6 +28,60 @@
+ #include "ui/input.h"
+ #include "ui/sdl2.h"
+ 
++/*
++ * qemu-jornada720: QEMU_SDL_SCALE (see sdl2_2d_switch) picks how the guest
++ * screen is scaled to the window:
++ *   integer - whole factors only: sharp, may leave borders
++ *   linear  - smooth
++ *   sharp   - "sharp bilinear": nearest to the largest whole factor that
++ *             fits, then linear for the rest; nearly as crisp as integer
++ *             and fills the window
++ * Any of them also makes the window high-DPI (see sdl2_window_create),
++ * so scaling happens at the screen's real resolution.
++ */
++static bool sdl2_scale_mode(const char *mode)
++{
++    const char *m = getenv("QEMU_SDL_SCALE");
++
++    return m && !strcmp(m, mode);
++}
++
++static void sdl2_2d_draw(struct sdl2_console *scon)
++{
++    SDL_Renderer *r = scon->real_renderer;
++    SDL_Texture *src = scon->texture;
++    int w = surface_width(scon->surface), h = surface_height(scon->surface);
++    int ow, oh, k;
++
++    if (sdl2_scale_mode("sharp") && SDL_RenderTargetSupported(r) &&
++        SDL_GetRendererOutputSize(r, &ow, &oh) == 0) {
++        k = MAX(1, MIN(ow / w, oh / h));
++        if (scon->sharp_target && scon->sharp_factor != k) {
++            SDL_DestroyTexture(scon->sharp_target);
++            scon->sharp_target = NULL;
++        }
++        if (!scon->sharp_target) {
++            scon->sharp_target = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888,
++                                                   SDL_TEXTUREACCESS_TARGET,
++                                                   w * k, h * k);
++            scon->sharp_factor = k;
++            if (scon->sharp_target) {
++                SDL_SetTextureScaleMode(scon->sharp_target,
++                                        SDL_ScaleModeLinear);
++            }
++        }
++        if (scon->sharp_target &&
++            SDL_SetRenderTarget(r, scon->sharp_target) == 0) {
++            SDL_RenderCopy(r, src, NULL, NULL);
++            SDL_SetRenderTarget(r, NULL);
++            src = scon->sharp_target;
++        }
++    }
++    SDL_RenderClear(r);
++    SDL_RenderCopy(r, src, NULL, NULL);
++    SDL_RenderPresent(r);
++}
++
+ void sdl2_2d_update(DisplayChangeListener *dcl,
+                     int x, int y, int w, int h)
+ {
+@@ -51,9 +105,7 @@
+     SDL_UpdateTexture(scon->texture, &rect,
+                       surface_data(surf) + surface_data_offset,
+                       surface_stride(surf));
+-    SDL_RenderClear(scon->real_renderer);
+-    SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+-    SDL_RenderPresent(scon->real_renderer);
++    sdl2_2d_draw(scon);
+ }
+ 
+ void sdl2_2d_switch(DisplayChangeListener *dcl,
+@@ -71,6 +123,10 @@
+         SDL_DestroyTexture(scon->texture);
+         scon->texture = NULL;
+     }
++    if (scon->sharp_target) {
++        SDL_DestroyTexture(scon->sharp_target);
++        scon->sharp_target = NULL;
++    }
+ 
+     if (surface_is_placeholder(new_surface) && qemu_console_get_index(dcl->con)) {
+         sdl2_window_destroy(scon);
+@@ -121,20 +177,10 @@
+                                       SDL_TEXTUREACCESS_STREAMING,
+                                       surface_width(new_surface),
+                                       surface_height(new_surface));
+-    /*
+-     * qemu-jornada720: QEMU_SDL_SCALE=integer scales only by whole
+-     * factors (sharp, may leave borders), =linear smooths a fractional
+-     * scale; unset keeps SDL's default (nearest, uneven pixels).
+-     */
+-    {
+-        const char *mode = getenv("QEMU_SDL_SCALE");
+-
+-        SDL_RenderSetIntegerScale(scon->real_renderer,
+-                                  mode && !strcmp(mode, "integer"));
+-        SDL_SetTextureScaleMode(scon->texture,
+-                                mode && !strcmp(mode, "linear") ?
+-                                SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+-    }
++    /* qemu-jornada720: see sdl2_2d_draw() */
++    SDL_RenderSetIntegerScale(scon->real_renderer, sdl2_scale_mode("integer"));
++    SDL_SetTextureScaleMode(scon->texture, sdl2_scale_mode("linear") ?
++                            SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+     sdl2_2d_redraw(scon);
+ }
+ 

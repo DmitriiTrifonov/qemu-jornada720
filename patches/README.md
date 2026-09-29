@@ -25,6 +25,7 @@ git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
 git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
 git apply ../patches/0013-sdl2-integer-or-linear-scaling.patch
+git apply ../patches/0014-sdl2-hidpi-and-sharp-bilinear.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
@@ -100,3 +101,8 @@ git apply ../patches/0013-sdl2-integer-or-linear-scaling.patch
   `linear` — сглаживание при дробном масштабе. Без неё — как в апстриме
   (nearest, неровные пиксели). На телефоне окно 720x360 логических
   пикселей при scale 3: 640→720 давало дублирование каждого 8-го столбца.
+- `0014-...` — `ui/sdl2.c`, `ui/sdl2-2d.c`, `include/ui/sdl2.h` (после
+  `0013`): при заданном `QEMU_SDL_SCALE` окно high-DPI (на телефоне
+  2160x1080 вместо 720x360, масштабирование в реальном разрешении) и режим
+  `sharp`: nearest до наибольшего целого множителя в промежуточную
+  текстуру, затем linear до окна. Касания проверены в sharp и integer.
