@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index eae0636..af315b0 100644
+index eae0636..d02ed9b 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -221,6 +221,13 @@ config COLLIE
+@@ -221,6 +221,14 @@ config COLLIE
      select ZAURUS_SCOOP
      select STRONGARM
  
@@ -12,6 +12,7 @@ index eae0636..af315b0 100644
 +    depends on TCG && ARM
 +    select PFLASH_CFI01
 +    select STRONGARM
++    select NE2000_COMMON
 +
  config SX1
      bool

@@ -8,7 +8,11 @@
  * Memory map (from Jornada 720 hardware docs):
  *   0x00000000  system Flash/ROM, 32 MiB    (SA_CS0)
  *   0x1a000000  debug board CL-CD1284 UART  -- unimplemented-device stub
- *   0x40000000  SA-1111 companion chip      (SA_CS4) -- unimplemented-device stub
+ *   0x20000000  PCMCIA socket 0 I/O         -- NE2000 network card
+ *   0x28000000  PCMCIA socket 0 attribute   -- the card's CIS and COR
+ *   0x40000000  SA-1111 companion chip      (SA_CS4) -- interrupt controller
+ *                                           and PCMCIA interface; the rest
+ *                                           is an unimplemented-device stub
  *   0x48000000  Epson display controller    -- registers + BitBLT engine
  *   0x48200000  Epson frame buffer, 512 KiB -- plain RAM + 640x240 RGB565 console
  *   0x80000000  SA-1110 USB device ctrl     -- read-back register stub
@@ -36,6 +40,9 @@
 #include "ui/surface.h"
 #include "ui/input.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/net/ne2000.h"
+#include "net/net.h"
 #include "migration/vmstate.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "system/address-spaces.h"
@@ -1000,6 +1007,503 @@ static const MemoryRegionOps j720_udc_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/*
+ * SA-1111 companion chip: interrupt controller and PCMCIA interface,
+ * with an NE2000-compatible network PC Card in socket 0 (the CF slot,
+ * socket 1, stays empty). Register layout from Linux
+ * (arch/arm/common/sa1111.c, drivers/pcmcia/sa1111_generic.c); the rest
+ * of the chip is still the unimplemented-device stub underneath.
+ *
+ * The CE ROM has NE2000.DLL and a Drivers\PCMCIA\Detect entry
+ * (DetectNE2000) for NE2000 cards, so the card only needs a plausible
+ * CIS: network function, one I/O configuration at 0x300-0x31f with an
+ * interrupt. The card's interrupt (nIREQ) drives socket 0's READY line,
+ * which the SA-1111 interrupt controller sees as IRQ 49 (S0_READY_NINT);
+ * the controller's output goes to SA-1110 GPIO1, as on the real board.
+ *
+ * SA-1110 static memory for socket 0: I/O at 0x20000000, attribute
+ * memory at 0x28000000 (CIS on even bytes, configuration registers at
+ * 0x3f8), common memory at 0x2c000000 (unused).
+ */
+#define J720_SA1111_INTC_BASE   (J720_SA1111_BASE + 0x1600)
+#define J720_SA1111_PCMCIA_BASE (J720_SA1111_BASE + 0x1800)
+#define J720_PCMCIA_S0_IO       0x20000000
+#define J720_PCMCIA_S0_ATTR     0x28000000
+#define J720_PCMCIA_WINDOW      (64 * MiB)
+#define J720_GPIO_SA1111_IRQ    1
+
+#define SA1111_INTEN0           0x08
+#define SA1111_INTEN1           0x0c
+#define SA1111_INTPOL0          0x10
+#define SA1111_INTPOL1          0x14
+#define SA1111_INTSTATCLR0      0x1c
+#define SA1111_INTSTATCLR1      0x20
+#define SA1111_INTSET0          0x24
+#define SA1111_INTSET1          0x28
+#define SA1111_WAKEEN0          0x2c
+#define SA1111_WAKEEN1          0x30
+#define SA1111_WAKEPOL0         0x34
+#define SA1111_WAKEPOL1         0x38
+
+/* interrupt numbers 32..63 live in bank 1 */
+#define SA1111_IRQ_S0_READY_NINT (49 - 32)
+
+#define SA1111_PCCR             0x00
+#define SA1111_PCSSR            0x04
+#define SA1111_PCSR             0x08
+#define PCSR_S0_READY           (1 << 0)
+#define PCSR_S1_READY           (1 << 1)
+#define PCSR_S0_DETECT          (1 << 2)    /* 1 = socket empty */
+#define PCSR_S1_DETECT          (1 << 3)
+#define PCSR_S0_VS1             (1 << 4)    /* 0 = 3.3 V card */
+#define PCSR_S0_VS2             (1 << 5)
+#define PCSR_S1_VS1             (1 << 6)
+#define PCSR_S1_VS2             (1 << 7)
+#define PCSR_S0_BVD1            (1 << 10)
+#define PCSR_S0_BVD2            (1 << 11)
+#define PCSR_S1_BVD1            (1 << 12)
+#define PCSR_S1_BVD2            (1 << 13)
+#define PCCR_S0_RST             (1 << 0)
+
+#define J720_CARD_COR           0x3f8       /* attribute memory offsets */
+#define J720_CARD_CCSR          0x3fa
+#define J720_CARD_CFG_INDEX     0x20
+#define COR_SRESET              0x80
+#define COR_INDEX_MASK          0x3f
+#define CCSR_INTR               0x02
+
+#define TYPE_J720_SA1111 "j720-sa1111"
+OBJECT_DECLARE_SIMPLE_TYPE(J720SA1111State, J720_SA1111)
+
+struct J720SA1111State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion intc_io;
+    MemoryRegion pcmcia_io;
+    MemoryRegion card_io;
+    MemoryRegion card_attr;
+    qemu_irq irq;               /* to SA-1110 GPIO1 */
+
+    uint32_t inten[2], intpol[2], intstat[2], wakeen[2], wakepol[2];
+    uint32_t intin[2];          /* current level of each interrupt input */
+    uint32_t pccr, pcssr;
+
+    uint8_t cor, ccsr;
+    bool card_irq;
+    uint8_t cis[128];
+    int cis_len;
+    NE2000State ne2000;
+};
+
+static void j720_sa1111_update(J720SA1111State *s)
+{
+    qemu_set_irq(s->irq, (s->intstat[0] & s->inten[0]) ||
+                         (s->intstat[1] & s->inten[1]));
+}
+
+/* Interrupt inputs are edge-detected; INTPOL set = falling edge */
+static void j720_sa1111_set_input(J720SA1111State *s, int bank, int bit,
+                                  bool level)
+{
+    uint32_t mask = 1u << bit;
+    bool old = s->intin[bank] & mask;
+
+    if (old == level) {
+        return;
+    }
+    s->intin[bank] ^= mask;
+    if (level == !(s->intpol[bank] & mask)) {
+        s->intstat[bank] |= mask;
+        j720_sa1111_update(s);
+    }
+}
+
+static bool j720_card_ready(J720SA1111State *s)
+{
+    if (s->pccr & PCCR_S0_RST) {
+        return false;
+    }
+    /* once configured as an I/O card, READY carries nIREQ */
+    return !((s->cor & COR_INDEX_MASK) && s->card_irq);
+}
+
+static void j720_card_update(J720SA1111State *s)
+{
+    j720_sa1111_set_input(s, 1, SA1111_IRQ_S0_READY_NINT,
+                          j720_card_ready(s));
+}
+
+static void j720_card_ne2000_irq(void *opaque, int n, int level)
+{
+    J720SA1111State *s = opaque;
+
+    s->card_irq = level;
+    s->ccsr = level ? s->ccsr | CCSR_INTR : s->ccsr & ~CCSR_INTR;
+    j720_card_update(s);
+}
+
+static uint64_t j720_sa1111_intc_read(void *opaque, hwaddr addr,
+                                      unsigned size)
+{
+    J720SA1111State *s = opaque;
+
+    switch (addr) {
+    case SA1111_INTEN0:      return s->inten[0];
+    case SA1111_INTEN1:      return s->inten[1];
+    case SA1111_INTPOL0:     return s->intpol[0];
+    case SA1111_INTPOL1:     return s->intpol[1];
+    case SA1111_INTSTATCLR0: return s->intstat[0];
+    case SA1111_INTSTATCLR1: return s->intstat[1];
+    case SA1111_WAKEEN0:     return s->wakeen[0];
+    case SA1111_WAKEEN1:     return s->wakeen[1];
+    case SA1111_WAKEPOL0:    return s->wakepol[0];
+    case SA1111_WAKEPOL1:    return s->wakepol[1];
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1111-intc: read 0x%02" HWADDR_PRIx
+                      "\n", addr);
+        return 0;
+    }
+}
+
+static void j720_sa1111_intc_write(void *opaque, hwaddr addr, uint64_t value,
+                                   unsigned size)
+{
+    J720SA1111State *s = opaque;
+
+    switch (addr) {
+    case SA1111_INTEN0:      s->inten[0] = value; break;
+    case SA1111_INTEN1:      s->inten[1] = value; break;
+    case SA1111_INTPOL0:     s->intpol[0] = value; break;
+    case SA1111_INTPOL1:     s->intpol[1] = value; break;
+    case SA1111_INTSTATCLR0: s->intstat[0] &= ~value; break;
+    case SA1111_INTSTATCLR1: s->intstat[1] &= ~value; break;
+    case SA1111_INTSET0:     s->intstat[0] |= value; break;
+    case SA1111_INTSET1:     s->intstat[1] |= value; break;
+    case SA1111_WAKEEN0:     s->wakeen[0] = value; break;
+    case SA1111_WAKEEN1:     s->wakeen[1] = value; break;
+    case SA1111_WAKEPOL0:    s->wakepol[0] = value; break;
+    case SA1111_WAKEPOL1:    s->wakepol[1] = value; break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1111-intc: write 0x%02" HWADDR_PRIx
+                      " value 0x%" PRIx64 "\n", addr, value);
+        break;
+    }
+    j720_sa1111_update(s);
+}
+
+static const MemoryRegionOps j720_sa1111_intc_ops = {
+    .read = j720_sa1111_intc_read,
+    .write = j720_sa1111_intc_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t j720_sa1111_pcmcia_read(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    J720SA1111State *s = opaque;
+
+    switch (addr) {
+    case SA1111_PCCR:
+        return s->pccr;
+    case SA1111_PCSSR:
+        return s->pcssr;
+    case SA1111_PCSR:
+        /* socket 0: 3.3 V card present; socket 1: empty */
+        return (j720_card_ready(s) ? PCSR_S0_READY : 0) | PCSR_S0_VS2 |
+               PCSR_S0_BVD1 | PCSR_S0_BVD2 |
+               PCSR_S1_DETECT | PCSR_S1_VS1 | PCSR_S1_VS2 |
+               PCSR_S1_BVD1 | PCSR_S1_BVD2;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1111-pcmcia: read 0x%02" HWADDR_PRIx
+                      "\n", addr);
+        return 0;
+    }
+}
+
+static void j720_sa1111_pcmcia_write(void *opaque, hwaddr addr,
+                                     uint64_t value, unsigned size)
+{
+    J720SA1111State *s = opaque;
+
+    switch (addr) {
+    case SA1111_PCCR:
+        if ((value & PCCR_S0_RST) && !(s->pccr & PCCR_S0_RST)) {
+            s->cor = 0;
+            ne2000_reset(&s->ne2000);
+        }
+        s->pccr = value;
+        j720_card_update(s);
+        break;
+    case SA1111_PCSSR:
+        s->pcssr = value;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1111-pcmcia: write 0x%02"
+                      HWADDR_PRIx " value 0x%" PRIx64 "\n", addr, value);
+        break;
+    }
+}
+
+static const MemoryRegionOps j720_sa1111_pcmcia_ops = {
+    .read = j720_sa1111_pcmcia_read,
+    .write = j720_sa1111_pcmcia_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* Attribute memory: CIS on even bytes, then COR and CCSR */
+static uint64_t j720_card_attr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720SA1111State *s = opaque;
+    uint32_t off = addr & ~1;
+    uint8_t b = 0xff;
+
+    if (off / 2 < s->cis_len) {
+        b = s->cis[off / 2];
+    } else if (off == J720_CARD_COR) {
+        b = s->cor;
+    } else if (off == J720_CARD_CCSR) {
+        b = s->ccsr;
+    }
+    if (addr & 1) {
+        return 0xff;    /* odd bytes of attribute memory are undefined */
+    }
+    return size == 2 ? b | 0xff00 : b;
+}
+
+static void j720_card_attr_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    J720SA1111State *s = opaque;
+
+    switch (addr) {
+    case J720_CARD_COR:
+        if (value & COR_SRESET) {
+            ne2000_reset(&s->ne2000);
+            value = 0;
+        }
+        s->cor = value;
+        j720_card_update(s);
+        break;
+    case J720_CARD_CCSR:
+        s->ccsr = (s->ccsr & CCSR_INTR) | (value & ~CCSR_INTR);
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps j720_card_attr_ops = {
+    .read = j720_card_attr_read,
+    .write = j720_card_attr_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 2,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/*
+ * I/O space: the card decodes 5 address lines (32 NE2000 ports). A
+ * 16-bit access outside the data port reads/writes two adjacent 8-bit
+ * registers, as a 16-bit PC Card does.
+ */
+static uint64_t j720_card_io_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720SA1111State *s = opaque;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    uint64_t v = 0, b;
+    unsigned port = addr & 0x1f, i;
+
+    if (!(s->cor & COR_INDEX_MASK)) {
+        return (1ULL << (size * 8)) - 1;
+    }
+    if (port == 0x10 || size == 1) {
+        memory_region_dispatch_read(&s->ne2000.io, port, &v,
+                                    size_memop(size), attrs);
+        return v;
+    }
+    for (i = 0; i < size; i++) {
+        memory_region_dispatch_read(&s->ne2000.io, (port + i) & 0x1f, &b,
+                                    MO_8, attrs);
+        v |= b << (8 * i);
+    }
+    return v;
+}
+
+static void j720_card_io_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    J720SA1111State *s = opaque;
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    unsigned port = addr & 0x1f, i;
+
+    if (!(s->cor & COR_INDEX_MASK)) {
+        return;
+    }
+    if (port == 0x10 || size == 1) {
+        memory_region_dispatch_write(&s->ne2000.io, port, value,
+                                     size_memop(size), attrs);
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        memory_region_dispatch_write(&s->ne2000.io, (port + i) & 0x1f,
+                                     (value >> (8 * i)) & 0xff, MO_8, attrs);
+    }
+}
+
+static const MemoryRegionOps j720_card_io_ops = {
+    .read = j720_card_io_read,
+    .write = j720_card_io_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void j720_card_build_cis(J720SA1111State *s)
+{
+    static const char vers[] = "QEMU\0NE2000 Compatible PC Card\0";
+    uint8_t *p = s->cis;
+    int i;
+
+    /* CISTPL_DEVICE: no common memory */
+    *p++ = 0x01; *p++ = 0x02; *p++ = 0x00; *p++ = 0xff;
+    /* CISTPL_VERS_1 4.1 */
+    *p++ = 0x15; *p++ = 2 + sizeof(vers) - 1 + 1;
+    *p++ = 0x04; *p++ = 0x01;
+    memcpy(p, vers, sizeof(vers) - 1);
+    p += sizeof(vers) - 1;
+    *p++ = 0xff;
+    /* CISTPL_FUNCID: network adapter */
+    *p++ = 0x21; *p++ = 0x02; *p++ = 0x06; *p++ = 0x00;
+    /* CISTPL_FUNCE: LAN node ID */
+    *p++ = 0x22; *p++ = 0x08; *p++ = 0x04; *p++ = 0x06;
+    for (i = 0; i < 6; i++) {
+        *p++ = s->ne2000.c.macaddr.a[i];
+    }
+    /* CISTPL_CONFIG: 2-byte register base 0x3f8, COR+CCSR present */
+    *p++ = 0x1a; *p++ = 0x05; *p++ = 0x01; *p++ = J720_CARD_CFG_INDEX;
+    *p++ = J720_CARD_COR & 0xff; *p++ = J720_CARD_COR >> 8; *p++ = 0x03;
+    /*
+     * CISTPL_CFTABLE_ENTRY: index 0x20 (default, interface byte), I/O
+     * interface; features: I/O space and IRQ; 8/16-bit I/O, 5 address
+     * lines, one range 0x300 + 32; level IRQ, any of 0-15.
+     */
+    *p++ = 0x1b; *p++ = 0x0b;
+    *p++ = 0xc0 | J720_CARD_CFG_INDEX; *p++ = 0x01; *p++ = 0x18;
+    *p++ = 0xe5; *p++ = 0x60; *p++ = 0x00; *p++ = 0x03; *p++ = 0x1f;
+    *p++ = 0x30; *p++ = 0xff; *p++ = 0xff;
+    /* CISTPL_END */
+    *p++ = 0xff;
+    s->cis_len = p - s->cis;
+    assert(s->cis_len <= sizeof(s->cis));
+}
+
+static NetClientInfo j720_ne2000_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = ne2000_receive,
+};
+
+static void j720_sa1111_realize(DeviceState *dev, Error **errp)
+{
+    J720SA1111State *s = J720_SA1111(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    NE2000State *ne = &s->ne2000;
+
+    memory_region_init_io(&s->intc_io, OBJECT(dev), &j720_sa1111_intc_ops, s,
+                          "j720.sa1111-intc", 0x100);
+    memory_region_init_io(&s->pcmcia_io, OBJECT(dev), &j720_sa1111_pcmcia_ops,
+                          s, "j720.sa1111-pcmcia", 0x100);
+    memory_region_init_io(&s->card_io, OBJECT(dev), &j720_card_io_ops, s,
+                          "j720.pcmcia0-io", J720_PCMCIA_WINDOW);
+    memory_region_init_io(&s->card_attr, OBJECT(dev), &j720_card_attr_ops, s,
+                          "j720.pcmcia0-attr", J720_PCMCIA_WINDOW);
+    sysbus_init_mmio(sbd, &s->intc_io);
+    sysbus_init_mmio(sbd, &s->pcmcia_io);
+    sysbus_init_mmio(sbd, &s->card_io);
+    sysbus_init_mmio(sbd, &s->card_attr);
+    sysbus_init_irq(sbd, &s->irq);
+
+    ne2000_setup_io(ne, dev, 0x20);
+    /*
+     * The I/O window forwards into this region from its own handler; the
+     * guard against re-entrant I/O on one device would drop every access.
+     */
+    ne->io.disable_reentrancy_guard = true;
+    ne->irq = qemu_allocate_irq(j720_card_ne2000_irq, s, 0);
+    qemu_macaddr_default_if_unset(&ne->c.macaddr);
+    ne2000_reset(ne);
+    ne->nic = qemu_new_nic(&j720_ne2000_info, &ne->c,
+                           object_get_typename(OBJECT(dev)), dev->id,
+                           &dev->mem_reentrancy_guard, ne);
+    qemu_format_nic_info_str(qemu_get_queue(ne->nic), ne->c.macaddr.a);
+    j720_card_build_cis(s);
+
+    s->intin[1] = 1u << SA1111_IRQ_S0_READY_NINT;  /* card ready */
+}
+
+static int j720_sa1111_post_load(void *opaque, int version_id)
+{
+    J720SA1111State *s = opaque;
+
+    j720_sa1111_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_j720_sa1111 = {
+    .name = TYPE_J720_SA1111,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = j720_sa1111_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(inten, J720SA1111State, 2),
+        VMSTATE_UINT32_ARRAY(intpol, J720SA1111State, 2),
+        VMSTATE_UINT32_ARRAY(intstat, J720SA1111State, 2),
+        VMSTATE_UINT32_ARRAY(wakeen, J720SA1111State, 2),
+        VMSTATE_UINT32_ARRAY(wakepol, J720SA1111State, 2),
+        VMSTATE_UINT32_ARRAY(intin, J720SA1111State, 2),
+        VMSTATE_UINT32(pccr, J720SA1111State),
+        VMSTATE_UINT32(pcssr, J720SA1111State),
+        VMSTATE_UINT8(cor, J720SA1111State),
+        VMSTATE_UINT8(ccsr, J720SA1111State),
+        VMSTATE_BOOL(card_irq, J720SA1111State),
+        VMSTATE_STRUCT(ne2000, J720SA1111State, 0, vmstate_ne2000,
+                       NE2000State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const Property j720_sa1111_properties[] = {
+    DEFINE_NIC_PROPERTIES(J720SA1111State, ne2000.c),
+};
+
+static void j720_sa1111_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = j720_sa1111_realize;
+    dc->vmsd = &vmstate_j720_sa1111;
+    device_class_set_props(dc, j720_sa1111_properties);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo j720_sa1111_typeinfo = {
+    .name = TYPE_J720_SA1111,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(J720SA1111State),
+    .class_init = j720_sa1111_class_init,
+};
+
 #define TYPE_JORNADA720_MACHINE MACHINE_TYPE_NAME("jornada720")
 OBJECT_DECLARE_SIMPLE_TYPE(Jornada720MachineState, JORNADA720_MACHINE)
 
@@ -1105,6 +1609,22 @@ static void jornada720_init(MachineState *machine)
     }
 
     {
+        DeviceState *dev = qdev_new(TYPE_J720_SA1111);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+        qemu_configure_nic_device(dev, true, NULL);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                J720_SA1111_INTC_BASE, sysbus_mmio_get_region(sbd, 0), 1);
+        memory_region_add_subregion_overlap(get_system_memory(),
+                J720_SA1111_PCMCIA_BASE, sysbus_mmio_get_region(sbd, 1), 1);
+        sysbus_mmio_map(sbd, 2, J720_PCMCIA_S0_IO);
+        sysbus_mmio_map(sbd, 3, J720_PCMCIA_S0_ATTR);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(jms->sa1110->gpio,
+                                                    J720_GPIO_SA1111_IRQ));
+    }
+
+    {
         MemoryRegion *udc = g_new(MemoryRegion, 1);
         memory_region_init_io(udc, NULL, &j720_udc_ops, jms->udc_reg,
                               "j720.sa1110-udc", J720_SA1110_UDC_SIZE);
@@ -1177,6 +1697,7 @@ static const TypeInfo jornada720_machine_typeinfo = {
 static void jornada720_machine_register_types(void)
 {
     type_register_static(&j720_mcu_typeinfo);
+    type_register_static(&j720_sa1111_typeinfo);
     type_register_static(&jornada720_machine_typeinfo);
 }
 type_init(jornada720_machine_register_types);

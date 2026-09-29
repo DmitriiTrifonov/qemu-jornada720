@@ -25,7 +25,8 @@ git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
 ```
 
-- `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
+- `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
+  машина тянет ядро NE2000 (`NE2000_COMMON`) для сетевой карты.
 - `0002-...` — правка `target/arm/helper.c`: добавляет SA-1110-специфичный
   регистр CP15 `c1,c1,0` (Auxiliary Control Register) как RAZ/WI в таблицу
   `strongarm_cp_reginfo`. Без этого реальный ROM Jornada 720 падает в
