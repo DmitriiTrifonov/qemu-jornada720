@@ -1,3 +1,4 @@
 /qemu-src/
 /build/
 /roms/
+*.log
