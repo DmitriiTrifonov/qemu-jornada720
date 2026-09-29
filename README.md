@@ -1,78 +1,81 @@
 # qemu-jornada720
 
-Машина **HP Jornada 720** (Handheld PC, StrongARM SA-1110) для **QEMU**:
-настоящий ROM с **Windows CE (H/PC 2000)** грузится до рабочего стола,
-работают экран, клавиатура и тачскрин.
+[**English**](README.md) · [Русский](README.ru.md)
 
-![Рабочий стол CE в эмуляторе](docs/img/desktop-clean.png)
+An **HP Jornada 720** (Handheld PC, StrongARM SA-1110) machine for **QEMU**:
+the real **Windows CE (H/PC 2000)** ROM boots to the desktop, with working
+display, keyboard and touchscreen.
 
-Локальный эксперимент, не для апстрима QEMU (см. `src/hw/arm/jornada720.c`).
+![CE desktop in the emulator](docs/img/desktop-clean.png)
 
-## Что работает
+A local experiment, not meant for QEMU upstream (see `src/hw/arm/jornada720.c`).
 
-- Загрузка настоящего ROM до рабочего стола: ~50 с (~25 с с `--fast`).
-- Время CE (тик, таймеры, часы) идёт вровень с хостом.
-- Экран 640x240: frame buffer и 2D-движок BitBLT контроллера Epson S1D13806.
-- Клавиатура и тачскрин через MCU на SSP. Штатная калибровка CE проходит.
-- Батареи для CE «полные», предупреждений нет.
-- Сеть: в слоте PC Card вставлена NE2000-совместимая Ethernet-карта,
-  подключённая к встроенной сети QEMU (NAT, DHCP, DNS; root не нужен).
-  CE сам находит карту и получает адрес 10.0.2.15. HTTP-сайты открываются в
-  Pocket IE, HTTPS — нет: современные серверы не принимают старый TLS из CE.
-- Веб через FrogFind: `./frogfind-setup.sh` ставит локальную копию
-  [FrogFind](https://github.com/ActionRetro/FrogFind) (поиск через
-  DuckDuckGo и «читалка», упрощающая любые страницы, в том числе HTTPS), а
-  `run.sh` поднимает её вместе с эмулятором. В Pocket IE:
-  `http://10.0.2.2:8720/`. Нужны composer и PHP с dom, xml, gd, intl.
-- Русский ввод: переключите раскладку на телефоне (в sxmo/sway — Caps) и
-  печатайте — эмулятор набирает символы в CE как Alt + код символа
-  (драйвер клавиатуры CE это умеет). Кириллица отображается шрифтами ROM;
-  меню CE остаются английскими.
-- Файлы между телефоном и CE: всё, что лежит в `~/jornada-files`,
-  скачивается в Pocket IE с `http://10.0.2.2:8720/files/`, а форма внизу
-  той же страницы («Browse…» → «Upload») кладёт файл из CE в эту папку
-  (нужен только PHP).
-- Состояние сохраняется между запусками: при выходе машина усыпляется в
-  файл, при запуске восстанавливается за ~1 с. Реестр, калибровка и файлы
-  CE живут в RAM (на настоящем устройстве она на батарейке), так что без
-  этого каждый запуск был бы hard reset.
+## What works
 
-Чего нет: звук, IrDA, слот CF (пустой), USB. Эмуляции нужен `-icount`, поэтому
-она небыстрая. Подробности и открытые пункты — в `docs/plan.md`.
+- Booting the real ROM to the desktop: ~50 s (~25 s with `--fast`).
+- CE time (tick, timers, clock) runs in step with the host.
+- 640x240 display: frame buffer and 2D BitBLT engine of the Epson S1D13806 controller.
+- Keyboard and touchscreen via the MCU on the SSP. The stock CE calibration works.
+- Batteries read as "full" to CE, no warnings.
+- Networking: an NE2000-compatible Ethernet card sits in the PC Card slot,
+  attached to QEMU's built-in network (NAT, DHCP, DNS; no root needed).
+  CE finds the card by itself and gets the address 10.0.2.15. HTTP sites open
+  in Pocket IE; HTTPS does not: modern servers reject the old TLS from CE.
+- Web via FrogFind: `./frogfind-setup.sh` installs a local copy of
+  [FrogFind](https://github.com/ActionRetro/FrogFind) (search through
+  DuckDuckGo and a "reader" that simplifies any page, HTTPS included), and
+  `run.sh` starts it together with the emulator. In Pocket IE:
+  `http://10.0.2.2:8720/`. Requires composer and PHP with dom, xml, gd, intl.
+- Russian input: switch the layout on the phone (in sxmo/sway, Caps) and
+  type; the emulator enters the characters into CE as Alt + character code
+  (the CE keyboard driver supports this). Cyrillic is rendered with the ROM
+  fonts; CE menus stay in English.
+- Files between the phone and CE: everything in `~/jornada-files` can be
+  downloaded in Pocket IE from `http://10.0.2.2:8720/files/`, and the form at
+  the bottom of the same page ("Browse…" → "Upload") puts a file from CE
+  into that folder (only PHP is needed).
+- State persists between runs: on exit the machine is suspended to a file,
+  and on start it is restored in ~1 s. The CE registry, calibration and files
+  live in RAM (battery-backed on the real device), so without this every
+  start would be a hard reset.
 
-## Запуск
+Not implemented: sound, IrDA, the CF slot (empty), USB. The emulation needs
+`-icount`, so it is not fast. Details and open items are in `docs/plan.md`.
+
+## Running
 
 ```
-./run.sh              # окно SDL, время CE идёт как у хоста; холодная загрузка ~50 с
-./run.sh --fast       # холодная загрузка ~25 с, но тик CE спешит (до ~16x)
-./run.sh --vnc        # без окна, VNC на localhost:5900
-./run.sh --fresh      # забыть сохранённое состояние, холодная загрузка
-./run.sh -- <args>    # дополнительные аргументы QEMU, например -full-screen
+./run.sh              # SDL window, CE time tracks the host; cold boot ~50 s
+./run.sh --fast       # cold boot ~25 s, but the CE tick runs fast (up to ~16x)
+./run.sh --vnc        # no window, VNC on localhost:5900
+./run.sh --fresh      # discard the saved state, cold boot
+./run.sh -- <args>    # extra QEMU arguments, e.g. -full-screen
 ```
 
-- Картинка растягивается на всё окно «sharp bilinear»: целое увеличение
-  без сглаживания, остаток — плавно. `QEMU_SDL_SCALE=integer ./run.sh` —
-  только целые множители (идеально чётко, с полями), `=linear` — мягко.
-- Мышь или палец = стилус. Клавиатура уходит в CE.
-- **Ctrl+Alt+Q**, закрытие окна или **Пуск → Suspend** в CE — выход с
-  сохранением; при следующем запуске CE продолжит с того же места
-  (`J720_SUSPEND_QUITS=0` — Suspend просто усыпляет CE до нажатия клавиши
-  или касания).
-  **Ctrl+Alt+F** — полный экран.
-- Сохранение: `~/.local/state/qemu-jornada720/j720.state` (~38 МБ). Если
-  QEMU не может его загрузить, файл переименовывается в `j720.state.bad`,
-  а машина грузится с нуля.
-- Чтобы остановить эмулятор извне с сохранением, пошлите SIGTERM процессу
-  `j720-save.py`. SIGTERM самому QEMU закрывает его **без** сохранения.
-- `J720_TOUCH_DEBUG=1` — лог касаний в stderr: координаты окна, пиксели
-  экрана, значения АЦП.
+- The picture is stretched to the whole window with "sharp bilinear":
+  integer upscaling without smoothing, the remainder smoothly.
+  `QEMU_SDL_SCALE=integer ./run.sh` uses integer factors only (perfectly
+  crisp, with borders), `=linear` is soft.
+- Mouse or finger = stylus. The keyboard goes to CE.
+- **Ctrl+Alt+Q**, closing the window, or **Start → Suspend** in CE quits
+  with a save; the next start resumes CE where it left off
+  (`J720_SUSPEND_QUITS=0` makes Suspend just put CE to sleep until a key
+  press or touch).
+  **Ctrl+Alt+F** toggles full screen.
+- Saved state: `~/.local/state/qemu-jornada720/j720.state` (~38 MB). If QEMU
+  cannot load it, the file is renamed to `j720.state.bad` and the machine
+  cold-boots.
+- To stop the emulator from outside with a save, send SIGTERM to the
+  `j720-save.py` process. SIGTERM to QEMU itself closes it **without** saving.
+- `J720_TOUCH_DEBUG=1` logs touches to stderr: window coordinates, screen
+  pixels, ADC values.
 
-Нужен ROM-дамп Jornada 720 в `roms/jornada720.bin` (32 МиБ, в git не
-входит).
+A Jornada 720 ROM dump is required at `roms/jornada720.bin` (32 MiB, not
+included in git).
 
-## Сборка
+## Building
 
-QEMU собирается из исходников с нашими патчами:
+QEMU is built from source with our patches:
 
 ```
 git clone https://gitlab.com/qemu-project/qemu.git qemu-src
@@ -82,14 +85,13 @@ mkdir build && cd build && ../qemu-src/configure --target-list=arm-softmmu
 ninja qemu-system-arm
 ```
 
-Для окна нужен SDL2, для сети — libslirp (dev-пакеты, до `configure`). Что делает каждый патч,
-описано в `patches/README.md`.
+The window needs SDL2 and networking needs libslirp (dev packages, before
+`configure`). What each patch does is described in `patches/README.md`.
 
-## Структура
+## Layout
 
-- `src/hw/arm/jornada720.c` — модель платы: память, Epson, MCU, заглушки.
-- `patches/` — правки QEMU: StrongARM-ядро, SA-1110, SDL-интерфейс.
-- `run.sh`, `j720-save.py` — запуск, а также сохранение и восстановление
-  через QMP.
-- `docs/plan.md` — план и статус работ, `docs/research.md` — разбор
-  железа и того, как находили каждую проблему.
+- `src/hw/arm/jornada720.c`: the board model: memory, Epson, MCU, stubs.
+- `patches/`: QEMU changes: StrongARM core, SA-1110, SDL frontend.
+- `run.sh`, `j720-save.py`: launching, plus save and restore over QMP.
+- `docs/plan.md`: plan and work status; `docs/research.md`: hardware
+  analysis and how each problem was tracked down.
