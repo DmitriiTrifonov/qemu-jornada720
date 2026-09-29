@@ -1,8 +1,11 @@
 #!/bin/sh
 # Start the HP Jornada 720 emulator in an SDL window.
 #
-#   ./run.sh              window (SDL), fast boot (~25 s to the desktop)
-#   ./run.sh --realtime   guest clock runs at real speed, boot ~50 s
+#   ./run.sh              window (SDL), CE time runs at real speed;
+#                         cold boot ~50 s, resume ~1 s
+#   ./run.sh --fast       CE time runs ~16x fast while CE is busy; cold
+#                         boot ~25 s (--realtime: the default, kept for
+#                         old callers)
 #   ./run.sh --vnc        no window, VNC on localhost:5900
 #   ./run.sh --fresh      forget the saved state, cold boot (hard reset)
 #   ./run.sh -- <args>    pass extra arguments to QEMU
@@ -15,10 +18,11 @@
 #
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
-# -icount is required (see docs/research.md). With the default shift=6
-# the CE clock runs ahead of real time while CE is busy (boot); on an
-# idle desktop it was measured at about real speed. shift=auto keeps it
-# in sync at the cost of a slower boot.
+# -icount is required (see docs/research.md). shift=auto keeps QEMU's
+# virtual time, and with it CE's tick (GetTickCount, timers, games), in
+# step with the host; it settles ~20 s after a start. With --fast
+# (shift=6) CE's tick was measured 16x fast in Solitaire. CE's clock
+# on the taskbar comes from the RTC, which follows the host in both.
 set -e
 
 cd "$(dirname "$0")"
@@ -31,11 +35,12 @@ STATE=$STATE_DIR/j720.state
 [ -x "$QEMU" ] || { echo "no $QEMU, build it first: ninja -C build qemu-system-arm" >&2; exit 1; }
 [ -f "$ROM" ] || { echo "no ROM image at $ROM" >&2; exit 1; }
 
-icount="shift=6,align=off"
+icount="shift=auto,align=off"
 display="-display sdl"
 while [ $# -gt 0 ]; do
     case "$1" in
         --realtime) icount="shift=auto,align=off" ;;
+        --fast) icount="shift=6,align=off" ;;
         --vnc) display="-display none -vnc 127.0.0.1:0" ;;
         --fresh) rm -f "$STATE" ;;
         --) shift; break ;;
