@@ -71,3 +71,5 @@ git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
   `SDL_HINT_GRAB_KEYBOARD=1`, и захват, срабатывавший при наведении,
   на Wayland блокировал все горячие клавиши sway: окно нельзя было
   закрыть. Плюс Ctrl+Alt+Q — выход, как в GTK-интерфейсе QEMU.
+  Ctrl и Alt годятся с любой стороны: у Bluetooth-клавиатуры пользователя
+  единственный Alt отдаёт код RightAlt, и LCtrl+LAlt не срабатывал.

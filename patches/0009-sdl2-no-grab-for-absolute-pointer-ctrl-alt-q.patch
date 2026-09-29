@@ -1,12 +1,10 @@
 diff --git a/ui/sdl2.c b/ui/sdl2.c
-index f55ba10..df68475 100644
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
-@@ -255,6 +255,15 @@ static void sdl_grab_start(struct sdl2_console *scon)
-     if (!con || !qemu_console_is_graphic(con)) {
+@@ -256,6 +256,15 @@
          return;
      }
-+    /*
+     /*
 +     * Local experiment for the qemu-jornada720 project: an absolute
 +     * pointer (touchscreen/tablet) needs no grab, and grabbing also grabs
 +     * the keyboard (SDL_HINT_GRAB_KEYBOARD), which on Wayland inhibits all
@@ -15,18 +13,32 @@ index f55ba10..df68475 100644
 +    if (qemu_input_is_absolute(con)) {
 +        return;
 +    }
-     /*
++    /*
       * If the application is not active, do not try to enter grab state. This
       * prevents 'SDL_WM_GrabInput(SDL_GRAB_ON)' from blocking all the
-@@ -424,6 +433,11 @@ static void handle_keydown(SDL_Event *ev)
-             toggle_full_screen(scon);
-             scon->gui_keysym = true;
+      * application (SDL bug).
+@@ -375,6 +384,12 @@
+             (gui_grab_code | KMOD_LSHIFT);
+     } else if (ctrl_grab) {
+         return (mod & KMOD_RCTRL) == KMOD_RCTRL;
++    } else if (gui_grab_code == (KMOD_LALT | KMOD_LCTRL)) {
++        /*
++         * qemu-jornada720: accept Ctrl and Alt of either side; some
++         * keyboards send RightAlt for their only Alt key.
++         */
++        return (mod & KMOD_CTRL) && (mod & KMOD_ALT);
+     } else {
+         return (mod & gui_grab_code) == gui_grab_code;
+     }
+@@ -422,6 +437,11 @@
              break;
+         case SDL_SCANCODE_F:
+             toggle_full_screen(scon);
++            scon->gui_keysym = true;
++            break;
 +        case SDL_SCANCODE_Q:
 +            /* qemu-jornada720: quit, like the GTK UI's Ctrl+Alt+Q */
 +            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
-+            scon->gui_keysym = true;
-+            break;
-         case SDL_SCANCODE_G:
              scon->gui_keysym = true;
-             if (!gui_grab) {
+             break;
+         case SDL_SCANCODE_G:
