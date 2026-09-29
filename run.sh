@@ -16,10 +16,12 @@
 # ${XDG_STATE_HOME:-~/.local/state}/qemu-jornada720/j720.state; a state
 # QEMU cannot load is moved to j720.state.bad and the machine cold boots.
 #
-# If FrogFind is installed (./frogfind-setup.sh), it is served for the
-# emulator's lifetime at http://10.0.2.2:8720/ (the host as seen from CE;
-# bound to 127.0.0.1 only): search and simplified pages for Pocket IE,
-# which cannot do modern HTTPS. Its log: $STATE_DIR/frogfind.log.
+# With PHP installed, a web server runs for the emulator's lifetime at
+# http://10.0.2.2:8720/ (the host as seen from CE; bound to 127.0.0.1
+# only): FrogFind, if installed (./frogfind-setup.sh) -- search and
+# simplified pages for Pocket IE, which cannot do modern HTTPS -- and
+# /files/, the host folder ~/jornada-files (or $J720_FILES) for
+# downloading into CE. Its log: $STATE_DIR/frogfind.log.
 #
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
@@ -56,13 +58,20 @@ done
 
 mkdir -p "$STATE_DIR"
 
-# DuckDuckGo turns away PHP's default (empty) User-Agent as a bot
+# Web server for CE (see the top): FrogFind, if installed, and /files/.
+# DuckDuckGo turns away PHP's default (empty) User-Agent as a bot.
 FROGFIND_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/qemu-jornada720/frogfind
 FROGFIND_UA="Mozilla/5.0 (X11; Linux aarch64; rv:128.0) Gecko/20100101 Firefox/128.0"
+J720_FILES=${J720_FILES:-$HOME/jornada-files}
+export J720_FILES
 php=$(command -v php85 || command -v php || true)
-if [ -n "$php" ] && [ -f "$FROGFIND_DIR/vendor/autoload.php" ]; then
+if [ -n "$php" ]; then
+    mkdir -p "$J720_FILES"
+    docroot=$FROGFIND_DIR
+    [ -f "$FROGFIND_DIR/vendor/autoload.php" ] || docroot=$J720_FILES
     PHP_CLI_SERVER_WORKERS=4 "$php" -d "user_agent=\"$FROGFIND_UA\"" \
-        -S 127.0.0.1:8720 -t "$FROGFIND_DIR" > "$STATE_DIR/frogfind.log" 2>&1 &
+        -S 127.0.0.1:8720 -t "$docroot" j720-router.php \
+        > "$STATE_DIR/frogfind.log" 2>&1 &
     frogfind_pid=$!
     trap 'kill $frogfind_pid 2>/dev/null' EXIT
     trap 'exit 1' INT TERM HUP
