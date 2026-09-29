@@ -95,3 +95,8 @@ The window needs SDL2 and networking needs libslirp (dev packages, before
 - `run.sh`, `j720-save.py`: launching, plus save and restore over QMP.
 - `docs/plan.md`: plan and work status; `docs/research.md`: hardware
   analysis and how each problem was tracked down.
+
+## License
+
+GPL-2.0-or-later, the same as QEMU, which this project extends and patches. See `LICENSE`.
+The Jornada 720 ROM is not included and remains the property of its owners.

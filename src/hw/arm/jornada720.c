@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * HP Jornada 720 (SA-1110-based Handheld PC) machine model.
  *
