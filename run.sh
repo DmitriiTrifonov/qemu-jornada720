@@ -16,6 +16,11 @@
 # ${XDG_STATE_HOME:-~/.local/state}/qemu-jornada720/j720.state; a state
 # QEMU cannot load is moved to j720.state.bad and the machine cold boots.
 #
+# If FrogFind is installed (./frogfind-setup.sh), it is served for the
+# emulator's lifetime at http://10.0.2.2:8720/ (the host as seen from CE;
+# bound to 127.0.0.1 only): search and simplified pages for Pocket IE,
+# which cannot do modern HTTPS. Its log: $STATE_DIR/frogfind.log.
+#
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
 # -icount is required (see docs/research.md). shift=auto keeps QEMU's
@@ -50,6 +55,19 @@ while [ $# -gt 0 ]; do
 done
 
 mkdir -p "$STATE_DIR"
+
+# DuckDuckGo turns away PHP's default (empty) User-Agent as a bot
+FROGFIND_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/qemu-jornada720/frogfind
+FROGFIND_UA="Mozilla/5.0 (X11; Linux aarch64; rv:128.0) Gecko/20100101 Firefox/128.0"
+php=$(command -v php85 || command -v php || true)
+if [ -n "$php" ] && [ -f "$FROGFIND_DIR/vendor/autoload.php" ]; then
+    PHP_CLI_SERVER_WORKERS=4 "$php" -d "user_agent=\"$FROGFIND_UA\"" \
+        -S 127.0.0.1:8720 -t "$FROGFIND_DIR" > "$STATE_DIR/frogfind.log" 2>&1 &
+    frogfind_pid=$!
+    trap 'kill $frogfind_pid 2>/dev/null' EXIT
+    trap 'exit 1' INT TERM HUP
+fi
+
 QMP_SOCK=${XDG_RUNTIME_DIR:-/tmp}/j720-qmp.$$.sock
 
 # run_qemu [--incoming] <QEMU args>: QEMU pauses on shutdown instead of
