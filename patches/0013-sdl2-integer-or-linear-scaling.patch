@@ -1,0 +1,24 @@
+diff --git a/ui/sdl2-2d.c b/ui/sdl2-2d.c
+--- a/ui/sdl2-2d.c
++++ b/ui/sdl2-2d.c
+@@ -121,6 +121,20 @@
+                                       SDL_TEXTUREACCESS_STREAMING,
+                                       surface_width(new_surface),
+                                       surface_height(new_surface));
++    /*
++     * qemu-jornada720: QEMU_SDL_SCALE=integer scales only by whole
++     * factors (sharp, may leave borders), =linear smooths a fractional
++     * scale; unset keeps SDL's default (nearest, uneven pixels).
++     */
++    {
++        const char *mode = getenv("QEMU_SDL_SCALE");
++
++        SDL_RenderSetIntegerScale(scon->real_renderer,
++                                  mode && !strcmp(mode, "integer"));
++        SDL_SetTextureScaleMode(scon->texture,
++                                mode && !strcmp(mode, "linear") ?
++                                SDL_ScaleModeLinear : SDL_ScaleModeNearest);
++    }
+     sdl2_2d_redraw(scon);
+ }
+ 

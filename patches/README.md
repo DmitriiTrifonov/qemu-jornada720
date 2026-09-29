@@ -24,6 +24,7 @@ git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
 git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
 git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
+git apply ../patches/0013-sdl2-integer-or-linear-scaling.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
@@ -94,3 +95,8 @@ git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
   если раскладка хоста не латинская (или клавиша даёт не-ASCII символ);
   Ctrl/Alt/Super-сочетания, пробел и служебные клавиши — как раньше.
   Плата Jornada набирает такие символы в CE через Alt + десятичный код.
+- `0013-...` — `ui/sdl2-2d.c`: переменная окружения `QEMU_SDL_SCALE`:
+  `integer` — масштаб только целыми множителями (чётко, возможны поля),
+  `linear` — сглаживание при дробном масштабе. Без неё — как в апстриме
+  (nearest, неровные пиксели). На телефоне окно 720x360 логических
+  пикселей при scale 3: 640→720 давало дублирование каждого 8-го столбца.

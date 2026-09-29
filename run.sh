@@ -23,6 +23,10 @@
 # /files/, the host folder ~/jornada-files (or $J720_FILES) for
 # downloading into CE. Its log: $STATE_DIR/frogfind.log.
 #
+# The window scales the 640x240 screen by whole factors only (sharp, may
+# leave borders); QEMU_SDL_SCALE=linear fills the window with smoothing,
+# =nearest is QEMU's old uneven scaling.
+#
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
 # -icount is required (see docs/research.md). shift=auto keeps QEMU's
@@ -57,6 +61,8 @@ while [ $# -gt 0 ]; do
 done
 
 mkdir -p "$STATE_DIR"
+QEMU_SDL_SCALE=${QEMU_SDL_SCALE:-integer}
+export QEMU_SDL_SCALE
 
 # Web server for CE (see the top): FrogFind, if installed, and /files/.
 # DuckDuckGo turns away PHP's default (empty) User-Agent as a bot.
@@ -70,6 +76,7 @@ if [ -n "$php" ]; then
     docroot=$FROGFIND_DIR
     [ -f "$FROGFIND_DIR/vendor/autoload.php" ] || docroot=$J720_FILES
     PHP_CLI_SERVER_WORKERS=4 "$php" -d "user_agent=\"$FROGFIND_UA\"" \
+        -d upload_max_filesize=256M -d post_max_size=256M \
         -S 127.0.0.1:8720 -t "$docroot" j720-router.php \
         > "$STATE_DIR/frogfind.log" 2>&1 &
     frogfind_pid=$!
