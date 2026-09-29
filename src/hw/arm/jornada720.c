@@ -312,6 +312,8 @@ static bool j720_wake_on_input(bool press)
  * single sample; keep the pen down until it has read this many.
  */
 #define J720_MCU_TS_MIN_SAMPLES 3
+/* ...but never hold a released pen down longer than this many periods */
+#define J720_MCU_TS_MAX_HOLD    20
 
 static const unsigned short j720_keymap[128] = {					/* ROW */
 	0, KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,		/* #1  */
@@ -360,6 +362,7 @@ struct J720MCUState {
 
     bool pen_down;
     bool pen_up_pending;        /* released before enough samples were read */
+    int pen_up_ticks;           /* periods pen_up_pending has lasted (not migrated) */
     int pen_samples;            /* GETTOUCHSAMPLES answered since pen down */
     int pen_x, pen_y;           /* 10-bit ADC values */
     int abs_x, abs_y;           /* last absolute pointer position from the UI */
@@ -659,7 +662,9 @@ static void j720_mcu_ts_tick(void *opaque)
 {
     J720MCUState *s = opaque;
 
-    if (s->pen_up_pending && s->pen_samples >= J720_MCU_TS_MIN_SAMPLES) {
+    if (s->pen_up_pending &&
+        (s->pen_samples >= J720_MCU_TS_MIN_SAMPLES ||
+         ++s->pen_up_ticks >= J720_MCU_TS_MAX_HOLD)) {
         j720_mcu_pen_up(s);
         return;
     }
@@ -716,6 +721,7 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
         if (btn->down) {
             s->pen_down = true;
             s->pen_up_pending = false;
+            s->pen_up_ticks = 0;
             s->pen_samples = 0;
             qemu_irq_lower(s->ts_irq);
             timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
