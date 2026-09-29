@@ -46,6 +46,8 @@
 #include "migration/vmstate.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
+#include "system/reset.h"
 #include "qom/object.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
@@ -111,47 +113,148 @@ static const MemoryRegionOps j720_ssp_stub_ops = {
 };
 
 /*
- * SA-1110 on-chip Power Manager block, 0x90020000 -- entirely missing from
- * hw/arm/strongarm.c (confirmed: no reference to it anywhere in that file).
- * Found by tracing where the ROM's OAL-style delay/poll loop (two
- * back-to-back ~100ms stalls, then re-check) reads its status word from:
- * the kernel's uncached alias 0xa3420000 resolves (via the page table
- * built at this point in boot, TTBR0 read live through the QEMU gdbstub)
- * to physical section base 0x90020000, and the polled word is at offset
- * 0x1c within it. Matches the real SA-1110 Power Manager register map
- * (PMCR=0x00, PSSR=0x04, PSPR=0x08, PWER=0x0c, PCFR=0x10, PPCR=0x14,
- * PGSR=0x18, POSR=0x1c) -- offset 0x1c is POSR, the Oscillator Status
- * Register, bit0 = "3.6864 MHz oscillator stable". Real hardware sets
- * this shortly after reset; our emulation never did, so the boot code's
- * "wait for oscillator" loop spun forever. Only bit0 of POSR is modeled;
- * everything else in this block still falls through to the
- * unimplemented-device stub below, so any further probes stay visible
- * via -d unimp. See docs/research.md.
+ * SA-1110 Power Manager (0x90020000) and Reset Controller (0x90030000),
+ * both missing from hw/arm/strongarm.c. Register map from the SA-1110
+ * Developer's Manual: PMCR, PSSR, PSPR, PWER, PCFR, PPCR, PGSR, POSR;
+ * RSRR, RCSR.
+ *
+ * POSR bit0 (oscillator stable) must read 1 or the boot code waits
+ * forever. PSPR is a scratch register kept through sleep; CE uses it.
+ *
+ * Sleep (CE's Suspend): writing PMCR.SF stops the machine (QEMU's
+ * suspended run state) until a key press or a tap wakes it, like the
+ * power button. Waking resets only the CPU, with RCSR.SMR and PSSR's
+ * sleep/hold bits set, and keeps RAM, PSPR and the peripherals: the ROM
+ * sees a sleep reset and resumes CE from the state it saved in RAM.
+ * GPIO wake-up enables (PWER) are stored but not honoured.
  */
-#define J720_SA1110_PM_BASE 0x90020000
-#define J720_SA1110_PM_SIZE (4 * KiB)
-#define J720_SA1110_PM_POSR_OFFSET 0x1c
-#define J720_SA1110_PM_POSR_BASE (J720_SA1110_PM_BASE + J720_SA1110_PM_POSR_OFFSET)
+#define J720_SA1110_PM_BASE     0x90020000
+#define J720_SA1110_PM_SIZE     (4 * KiB)
+#define J720_SA1110_RSTC_BASE   0x90030000
 
-static uint64_t j720_pm_posr_stub_read(void *opaque, hwaddr addr, unsigned size)
+#define SA_PMCR         0x00
+#define SA_PSSR         0x04
+#define SA_PSPR         0x08
+#define SA_PWER         0x0c
+#define SA_PCFR         0x10
+#define SA_PPCR         0x14
+#define SA_PGSR         0x18
+#define SA_POSR         0x1c
+#define PMCR_SF         (1 << 0)
+#define PSSR_SSS        (1 << 0)    /* software sleep */
+#define PSSR_DH         (1 << 3)    /* DRAM control held */
+#define PSSR_PH         (1 << 4)    /* peripheral control held */
+#define SA_RSRR         0x00
+#define SA_RCSR         0x04
+#define RSRR_SWR        (1 << 0)
+#define RCSR_HWR        (1 << 0)
+#define RCSR_SWR        (1 << 1)
+#define RCSR_SMR        (1 << 3)    /* sleep mode reset */
+
+typedef struct J720Power {
+    uint32_t pmcr, pssr, pspr, pwer, pcfr, ppcr, pgsr;
+    uint32_t rcsr;
+    bool sleeping;
+    bool soft_reset;            /* RSRR.SWR written: next reset reports SWR */
+} J720Power;
+
+static uint64_t j720_pm_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return 1; /* POSR bit0 (OOK): oscillator stable */
+    J720Power *p = opaque;
+
+    switch (addr) {
+    case SA_PMCR: return p->pmcr;
+    case SA_PSSR: return p->pssr;
+    case SA_PSPR: return p->pspr;
+    case SA_PWER: return p->pwer;
+    case SA_PCFR: return p->pcfr;
+    case SA_PPCR: return p->ppcr;
+    case SA_PGSR: return p->pgsr;
+    case SA_POSR: return 1;         /* OOK: oscillator stable */
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1110-pm: read 0x%02" HWADDR_PRIx
+                      "\n", addr);
+        return 0;
+    }
 }
 
-static void j720_pm_stub_write(void *opaque, hwaddr addr, uint64_t value,
-                                unsigned size)
+static void j720_pm_write(void *opaque, hwaddr addr, uint64_t value,
+                          unsigned size)
 {
+    J720Power *p = opaque;
+
+    switch (addr) {
+    case SA_PMCR:
+        p->pmcr = value;
+        if (value & PMCR_SF) {
+            p->sleeping = true;
+            qemu_system_suspend_request();
+        }
+        break;
+    case SA_PSSR: p->pssr &= ~value; break;     /* write 1 to clear */
+    case SA_PSPR: p->pspr = value; break;
+    case SA_PWER: p->pwer = value; break;
+    case SA_PCFR: p->pcfr = value; break;
+    case SA_PPCR: p->ppcr = value; break;
+    case SA_PGSR: p->pgsr = value; break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.sa1110-pm: write 0x%02" HWADDR_PRIx
+                      " value 0x%" PRIx64 "\n", addr, value);
+        break;
+    }
 }
 
-static const MemoryRegionOps j720_pm_posr_stub_ops = {
-    .read = j720_pm_posr_stub_read,
-    .write = j720_pm_stub_write,
-    .impl.min_access_size = 1,
+static const MemoryRegionOps j720_pm_ops = {
+    .read = j720_pm_read,
+    .write = j720_pm_write,
+    .impl.min_access_size = 4,
     .impl.max_access_size = 4,
-    .valid.min_access_size = 1,
+    .valid.min_access_size = 4,
     .valid.max_access_size = 4,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
+
+static uint64_t j720_rstc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720Power *p = opaque;
+
+    return addr == SA_RCSR ? p->rcsr : 0;
+}
+
+static void j720_rstc_write(void *opaque, hwaddr addr, uint64_t value,
+                            unsigned size)
+{
+    J720Power *p = opaque;
+
+    if (addr == SA_RCSR) {
+        p->rcsr &= ~value;                      /* write 1 to clear */
+    } else if (addr == SA_RSRR && (value & RSRR_SWR)) {
+        p->soft_reset = true;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static const MemoryRegionOps j720_rstc_ops = {
+    .read = j720_rstc_read,
+    .write = j720_rstc_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+/* Wake the machine if it sleeps; true if it did (the event is used up) */
+static bool j720_wake_on_input(bool press)
+{
+    if (!runstate_check(RUN_STATE_SUSPENDED)) {
+        return false;
+    }
+    if (press) {
+        qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+    }
+    return true;
+}
 
 /*
  * Keyboard/touchscreen/power micro-controller (MCU) on the SA-1110's
@@ -478,6 +581,9 @@ static bool j720_mcu_key_queue(J720MCUState *s, uint8_t b)
 
 static void j720_mcu_text(void *opaque, uint32_t codepoint)
 {
+    if (j720_wake_on_input(true)) {
+        return;
+    }
     j720_mcu_pend(opaque, codepoint);
 }
 
@@ -495,6 +601,10 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
     J720MCUState *s = J720_MCU(dev);
     unsigned int lnx = evt->key.key;    /* Linux key code */
     bool down = evt->key.down;
+
+    if (j720_wake_on_input(down)) {
+        return;
+    }
     bool held;
     int code;
 
@@ -557,6 +667,10 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
 {
     J720MCUState *s = J720_MCU(dev);
 
+    if (j720_wake_on_input(evt->type == INPUT_EVENT_KIND_BTN &&
+                           evt->btn.down)) {
+        return;
+    }
     switch (evt->type) {
     case INPUT_EVENT_KIND_ABS: {
         InputMoveEvent *move = &evt->abs;
@@ -1638,6 +1752,7 @@ struct Jornada720MachineState {
     StrongARMState *sa1110;
     J720Display display;
     uint32_t udc_reg[J720_SA1110_UDC_SIZE / 4];
+    J720Power power;
 };
 
 /*
@@ -1673,6 +1788,30 @@ static const VMStateDescription vmstate_j720_display = {
     }
 };
 
+static bool j720_power_needed(void *opaque)
+{
+    return true;    /* a subsection, so states saved before it still load */
+}
+
+static const VMStateDescription vmstate_j720_power = {
+    .name = "jornada720/power",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = j720_power_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(power.pmcr, Jornada720MachineState),
+        VMSTATE_UINT32(power.pssr, Jornada720MachineState),
+        VMSTATE_UINT32(power.pspr, Jornada720MachineState),
+        VMSTATE_UINT32(power.pwer, Jornada720MachineState),
+        VMSTATE_UINT32(power.pcfr, Jornada720MachineState),
+        VMSTATE_UINT32(power.ppcr, Jornada720MachineState),
+        VMSTATE_UINT32(power.pgsr, Jornada720MachineState),
+        VMSTATE_UINT32(power.rcsr, Jornada720MachineState),
+        VMSTATE_BOOL(power.sleeping, Jornada720MachineState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_jornada720 = {
     .name = "jornada720",
     .version_id = 1,
@@ -1683,8 +1822,53 @@ static const VMStateDescription vmstate_jornada720 = {
         VMSTATE_UINT32_ARRAY(udc_reg, Jornada720MachineState,
                              J720_SA1110_UDC_SIZE / 4),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_j720_power,
+        NULL
     }
 };
+
+/* Leave sleep: a sleep-mode reset of the CPU alone (see j720_pm_write) */
+static void jornada720_wake(Jornada720MachineState *jms)
+{
+    J720Power *p = &jms->power;
+
+    p->sleeping = false;
+    p->pmcr = 0;
+    p->pssr |= PSSR_SSS | PSSR_DH | PSSR_PH;
+    p->rcsr = RCSR_SMR;
+    cpu_reset(CPU(jms->sa1110->cpu));
+}
+
+static void jornada720_wakeup(MachineState *machine)
+{
+    jornada720_wake(JORNADA720_MACHINE(machine));
+}
+
+/*
+ * A state saved while CE slept loads as a running VM; wake it before the
+ * CPU runs, as if the power button had been pressed on start.
+ */
+static void jornada720_vm_state_change(void *opaque, bool running,
+                                       RunState state)
+{
+    Jornada720MachineState *jms = opaque;
+
+    if (running && jms->power.sleeping) {
+        jornada720_wake(jms);
+    }
+}
+
+static void jornada720_reset(void *opaque)
+{
+    J720Power *p = opaque;
+
+    p->rcsr = p->soft_reset ? RCSR_SWR : RCSR_HWR;
+    p->soft_reset = false;
+    p->sleeping = false;
+    p->pmcr = p->pssr = 0;
+}
 
 static void jornada720_init(MachineState *machine)
 {
@@ -1758,12 +1942,22 @@ static void jornada720_init(MachineState *machine)
     }
 
     {
-        MemoryRegion *pm_posr_stub = g_new(MemoryRegion, 1);
-        memory_region_init_io(pm_posr_stub, NULL, &j720_pm_posr_stub_ops, NULL,
-                               "j720.sa1110-pm-posr-stub", 4);
+        MemoryRegion *pm = g_new(MemoryRegion, 1);
+        MemoryRegion *rstc = g_new(MemoryRegion, 1);
+
+        memory_region_init_io(pm, NULL, &j720_pm_ops, &jms->power,
+                              "j720.sa1110-pm", 0x20);
         memory_region_add_subregion_overlap(get_system_memory(),
-                                             J720_SA1110_PM_POSR_BASE,
-                                             pm_posr_stub, 1);
+                                            J720_SA1110_PM_BASE, pm, 1);
+        memory_region_init_io(rstc, NULL, &j720_rstc_ops, &jms->power,
+                              "j720.sa1110-rstc", 0x8);
+        memory_region_add_subregion(get_system_memory(),
+                                    J720_SA1110_RSTC_BASE, rstc);
+        jms->power.rcsr = RCSR_HWR;
+        qemu_register_reset(jornada720_reset, &jms->power);
+        qemu_register_wakeup_support();
+        qemu_system_wakeup_enable(QEMU_WAKEUP_REASON_OTHER, true);
+        qemu_add_vm_change_state_handler(jornada720_vm_state_change, jms);
     }
 
     {
@@ -1810,6 +2004,7 @@ static void jornada720_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("sa1110");
     mc->default_ram_size = J720_RAM_SIZE;
     mc->default_ram_id = "strongarm.sdram";
+    mc->wakeup = jornada720_wakeup;
 }
 
 static const TypeInfo jornada720_machine_typeinfo = {

@@ -1,0 +1,115 @@
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -3044,16 +3044,6 @@
+       .access = PL1_RW, .resetvalue = 0,
+       .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
+     /*
+-     * SA-1110-specific Auxiliary Control Register (c1,c1,0). Not modeled;
+-     * real Jornada 720 ROM code writes it during early boot and expects it
+-     * to succeed. Local experiment for the qemu-jornada720 project, not
+-     * verified against the SA-1110 datasheet beyond "don't UNDEF here".
+-     */
+-    { .name = "C1_SA1110_AUX", .cp = 15, .crn = 1,
+-      .crm = 1, .opc1 = 0, .opc2 = 0,
+-      .access = PL1_RW, .resetvalue = 0,
+-      .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
+-    /*
+      * StrongARM power management (c15): enable/disable clock switching
+      * (c15,c1,2 / c15,c2,2) are no-ops here, and c15,c8,2 is "wait for
+      * interrupt" -- the Jornada 720 CE kernel idles with it. Without it
+@@ -3070,6 +3060,16 @@
+     { .name = "C15_SA_WFI", .cp = 15, .crn = 15,
+       .crm = 8, .opc1 = 0, .opc2 = 2,
+       .access = PL1_W, .type = ARM_CP_WFI | ARM_CP_OVERRIDE },
++    /*
++     * SA-1110 debug support (c14: data/instruction breakpoint registers),
++     * not modeled: read as zero, writes ignored. The Jornada 720's
++     * pcmcia.dll saves and restores them around Suspend. Local experiment
++     * for the qemu-jornada720 project.
++     */
++    { .name = "C14_SA_DEBUG", .cp = 15, .crn = 14,
++      .crm = CP_ANY, .opc1 = CP_ANY, .opc2 = CP_ANY,
++      .access = PL1_RW, .resetvalue = 0,
++      .type = ARM_CP_CONST | ARM_CP_OVERRIDE | ARM_CP_NO_RAW },
+ };
+ 
+ static uint64_t midr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+@@ -7250,7 +7250,48 @@
+         define_omap_cp_regs(cpu);
+     }
+     if (arm_feature(env, ARM_FEATURE_STRONGARM)) {
++        int crm;
++
+         define_arm_cp_regs(cpu, strongarm_cp_reginfo);
++        /*
++         * StrongARM ignores CRm for the MMU registers: translation table
++         * base (c2), fault status (c5) and fault address (c6); c3 already
++         * takes any CRm here. The Jornada 720's pcmcia.dll reads them as
++         * c2,c2,0 and c5,c5,0 while powering down for Suspend; an UNDEF
++         * there wrecked CE. Local experiment for the qemu-jornada720
++         * project.
++         */
++        for (crm = 1; crm < 16; crm++) {
++            char name[3][16];
++            ARMCPRegInfo mmu[] = {
++                { .name = name[0], .cp = 15, .crn = 2, .crm = crm,
++                  .opc1 = 0, .opc2 = 0, .access = PL1_RW,
++                  .type = ARM_CP_ALIAS,
++                  .writefn = vmsa_ttbr_write, .raw_writefn = raw_write,
++                  .bank_fieldoffsets = {
++                      offsetof(CPUARMState, cp15.ttbr0_s),
++                      offsetof(CPUARMState, cp15.ttbr0_ns) } },
++                { .name = name[1], .cp = 15, .crn = 5, .crm = crm,
++                  .opc1 = 0, .opc2 = 0, .access = PL1_RW,
++                  .type = ARM_CP_ALIAS,
++                  .bank_fieldoffsets = {
++                      offsetoflow32(CPUARMState, cp15.dfsr_s),
++                      offsetoflow32(CPUARMState, cp15.dfsr_ns) } },
++                { .name = name[2], .cp = 15, .crn = 6, .crm = crm,
++                  .opc1 = 0, .opc2 = 0, .access = PL1_RW,
++                  .type = ARM_CP_ALIAS,
++                  .bank_fieldoffsets = {
++                      offsetof(CPUARMState, cp15.dfar_s),
++                      offsetof(CPUARMState, cp15.dfar_ns) } },
++            };
++            int i;
++
++            for (i = 0; i < ARRAY_SIZE(mmu); i++) {
++                snprintf(name[i], sizeof(name[i]), "SA_C%d_ANY%d",
++                         mmu[i].crn, crm);
++                define_one_arm_cp_reg(cpu, &mmu[i]);
++            }
++        }
+     }
+     if (arm_feature(env, ARM_FEATURE_DUMMY_C15_REGS)) {
+         define_arm_cp_regs(cpu, dummy_c15_cp_reginfo);
+@@ -7628,6 +7669,28 @@
+             sctlr.type |= ARM_CP_SUPPRESS_TB_END;
+         }
+         define_one_arm_cp_reg(cpu, &sctlr);
++        if (arm_feature(env, ARM_FEATURE_STRONGARM)) {
++            /*
++             * StrongARM ignores CRm for c1 as for the other MMU registers
++             * (see strongarm_cp_reginfo's users): c1,c1..c15 are the
++             * control register. The Jornada 720 ROM saves and restores it
++             * around Suspend as c1,c1,0; this replaces an earlier RAZ/WI
++             * guess for that encoding, which resumed with the MMU off.
++             * Local experiment for the qemu-jornada720 project.
++             */
++            int crm;
++
++            for (crm = 1; crm < 16; crm++) {
++                char name[16];
++                ARMCPRegInfo alias = sctlr;
++
++                snprintf(name, sizeof(name), "SA_C1_ANY%d", crm);
++                alias.name = name;
++                alias.crm = crm;
++                alias.type |= ARM_CP_ALIAS;
++                define_one_arm_cp_reg(cpu, &alias);
++            }
++        }
+ 
+         if (arm_feature(env, ARM_FEATURE_PMSA) &&
+             arm_feature(env, ARM_FEATURE_V8)) {

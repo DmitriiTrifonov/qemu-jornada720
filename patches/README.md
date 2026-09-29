@@ -26,6 +26,7 @@ git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
 git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
 git apply ../patches/0013-sdl2-integer-or-linear-scaling.patch
 git apply ../patches/0014-sdl2-hidpi-and-sharp-bilinear.patch
+git apply ../patches/0015-strongarm-cp15-crm-ignored-debug-regs.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
@@ -106,3 +107,10 @@ git apply ../patches/0014-sdl2-hidpi-and-sharp-bilinear.patch
   2160x1080 вместо 720x360, масштабирование в реальном разрешении) и режим
   `sharp`: nearest до наибольшего целого множителя в промежуточную
   текстуру, затем linear до окна. Касания проверены в sharp и integer.
+- `0015-...` — `target/arm/helper.c` (после `0002`/`0004`/`0008`):
+  StrongARM игнорирует CRm у регистров MMU — `c1`, `c2`, `c5`, `c6` с любым
+  CRm теперь псевдонимы SCTLR/TTBR0/DFSR/DFAR (`c3` и так был), и `c14`
+  (отладочные регистры SA-1110) читается как 0. ROM и `pcmcia.dll`
+  сохраняют и восстанавливают их при Suspend как `cN,cN,0`; UNDEF на
+  `c2,c2` ронял CE. Убирает RAZ/WI-заглушку `c1,c1,0` из `0002`: с ней
+  регистр управления сохранялся как 0 и CE просыпался с выключенным MMU.
