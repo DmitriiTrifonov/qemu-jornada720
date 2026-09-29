@@ -2,6 +2,8 @@
 
 [English](README.md) · **Русский**
 
+[![License: GPL v2+](https://img.shields.io/badge/License-GPL_v2%2B-blue.svg)](LICENSE)
+
 Машина **HP Jornada 720** (Handheld PC, StrongARM SA-1110) для **QEMU**:
 настоящий ROM с **Windows CE (H/PC 2000)** грузится до рабочего стола,
 работают экран, клавиатура и тачскрин.

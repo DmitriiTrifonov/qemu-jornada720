@@ -2,6 +2,8 @@
 
 [**English**](README.md) · [Русский](README.ru.md)
 
+[![License: GPL v2+](https://img.shields.io/badge/License-GPL_v2%2B-blue.svg)](LICENSE)
+
 An **HP Jornada 720** (Handheld PC, StrongARM SA-1110) machine for **QEMU**:
 the real **Windows CE (H/PC 2000)** ROM boots to the desktop, with working
 display, keyboard and touchscreen.
