@@ -127,6 +127,10 @@ static const MemoryRegionOps j720_ssp_stub_ops = {
  * sleep/hold bits set, and keeps RAM, PSPR and the peripherals: the ROM
  * sees a sleep reset and resumes CE from the state it saved in RAM.
  * GPIO wake-up enables (PWER) are stored but not honoured.
+ *
+ * With J720_SUSPEND_QUITS=1 in the environment (run.sh's default), going
+ * to sleep also asks QEMU to shut down, so run.sh saves the sleeping
+ * machine and quits; it wakes when that state is loaded again.
  */
 #define J720_SA1110_PM_BASE     0x90020000
 #define J720_SA1110_PM_SIZE     (4 * KiB)
@@ -187,8 +191,13 @@ static void j720_pm_write(void *opaque, hwaddr addr, uint64_t value,
     case SA_PMCR:
         p->pmcr = value;
         if (value & PMCR_SF) {
+            const char *quit = getenv("J720_SUSPEND_QUITS");
+
             p->sleeping = true;
             qemu_system_suspend_request();
+            if (quit && !strcmp(quit, "1")) {
+                qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+            }
         }
         break;
     case SA_PSSR: p->pssr &= ~value; break;     /* write 1 to clear */

@@ -15,6 +15,9 @@
 # (touch calibration included) and files in RAM. State lives in
 # ${XDG_STATE_HOME:-~/.local/state}/qemu-jornada720/j720.state; a state
 # QEMU cannot load is moved to j720.state.bad and the machine cold boots.
+# CE's Start > Suspend saves and quits the same way; the next start wakes
+# CE where it went to sleep (J720_SUSPEND_QUITS=0: stay open, asleep
+# until a key or a tap).
 #
 # With PHP installed, a web server runs for the emulator's lifetime at
 # http://10.0.2.2:8720/ (the host as seen from CE; bound to 127.0.0.1
@@ -64,7 +67,8 @@ done
 
 mkdir -p "$STATE_DIR"
 QEMU_SDL_SCALE=${QEMU_SDL_SCALE:-sharp}
-export QEMU_SDL_SCALE
+J720_SUSPEND_QUITS=${J720_SUSPEND_QUITS:-1}
+export QEMU_SDL_SCALE J720_SUSPEND_QUITS
 
 # Web server for CE (see the top): FrogFind, if installed, and /files/.
 # DuckDuckGo turns away PHP's default (empty) User-Agent as a bot.
