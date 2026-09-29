@@ -16,8 +16,9 @@
 # Mouse = stylus (left button = pen down), keyboard goes to CE.
 # Ctrl+Alt+Q quits, Ctrl+Alt+F toggles fullscreen.
 # -icount is required (see docs/research.md). With the default shift=6
-# the CE clock runs roughly 12x faster than real time, because CE keeps
-# the CPU busy even when it looks idle; shift=auto keeps it in sync.
+# the CE clock runs ahead of real time while CE is busy (boot); on an
+# idle desktop it was measured at about real speed. shift=auto keeps it
+# in sync at the cost of a slower boot.
 set -e
 
 cd "$(dirname "$0")"

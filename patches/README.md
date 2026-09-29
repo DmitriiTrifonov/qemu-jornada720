@@ -22,6 +22,7 @@ git apply ../patches/0007-sdl2-no-double-scaling-of-logical-coords.patch
 git apply ../patches/0008-sa1110-c15-idle-wfi.patch
 git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
 git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
+git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build).
@@ -77,3 +78,10 @@ git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 - `0010-...` — правка `ui/sdl2.c` (после `0009`): закрытие окна больше не
   переключает `-action shutdown` на poweroff. Иначе `run.sh` не успевал
   сохранить машину: QEMU выходил, не встав на паузу.
+- `0011-...` — правка RTC в `hw/arm/strongarm.c` (после `0006`). Запись в
+  `RTSR` не могла выключить ALE/HZE (старые биты переживали запись), а
+  срок будильника считался в 32 битах: будильник дальше ~131 с от
+  `last_rcnr` срабатывал сразу. После восстановления это давало шквал
+  прерываний (~4000 IRQ/с против ~100): CE сбрасывал будильник, тот
+  тут же срабатывал снова, ввод тормозил на секунды. Теперь сроки
+  считаются в 64 битах от текущего RCNR.

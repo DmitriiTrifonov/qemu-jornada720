@@ -1,0 +1,62 @@
+diff --git a/hw/arm/strongarm.c b/hw/arm/strongarm.c
+--- a/hw/arm/strongarm.c
++++ b/hw/arm/strongarm.c
+@@ -278,18 +278,40 @@
+     s->last_hz = rt;
+ }
+ 
++/* rtc_clock ms since last_hz at which RCNR reaches last_rcnr + ticks */
++static int64_t strongarm_rtc_ticks_to_ms(StrongARMRTCState *s, uint64_t ticks)
++{
++    return (ticks * 1000 * ((s->rttr & 0xffff) + 1) + 32767) >> 15;
++}
++
++/*
++ * qemu-jornada720: deadlines were computed in 32 bits, so an alarm more
++ * than ~131 s past last_rcnr wrapped around and fired at once, and both
++ * timers counted from last_hz, which is only moved on RTTR/RCNR writes
++ * and on save. With CE re-arming its alarm from the interrupt handler
++ * that became an interrupt storm after a resume. Count from the current
++ * RCNR instead; like the hardware, an alarm set in the past (RTAR behind
++ * RCNR) does not fire until the counter wraps.
++ */
+ static inline void strongarm_rtc_timer_update(StrongARMRTCState *s)
+ {
++    int64_t now = qemu_clock_get_ms(rtc_clock);
++    uint64_t elapsed = (((uint64_t)MAX(now - s->last_hz, 0)) << 15) /
++                       (1000 * ((s->rttr & 0xffff) + 1));
++
+     if ((s->rtsr & RTSR_HZE) && !(s->rtsr & RTSR_HZ)) {
+-        timer_mod(s->rtc_hz, s->last_hz + 1000);
++        timer_mod(s->rtc_hz, s->last_hz +
++                  strongarm_rtc_ticks_to_ms(s, elapsed + 1));
+     } else {
+         timer_del(s->rtc_hz);
+     }
+ 
+     if ((s->rtsr & RTSR_ALE) && !(s->rtsr & RTSR_AL)) {
++        uint32_t rcnr = s->last_rcnr + elapsed;
++        uint32_t ahead = s->rtar - rcnr;
++
+         timer_mod(s->rtc_alarm, s->last_hz +
+-                (((s->rtar - s->last_rcnr) * 1000 *
+-                  ((s->rttr & 0xffff) + 1)) >> 15));
++                  strongarm_rtc_ticks_to_ms(s, elapsed + ahead));
+     } else {
+         timer_del(s->rtc_alarm);
+     }
+@@ -350,8 +372,13 @@
+ 
+     case RTSR:
+         old_rtsr = s->rtsr;
++        /*
++         * qemu-jornada720: ALE/HZE are plain read/write bits, AL/HZ are
++         * write-one-to-clear; the old ALE/HZE used to survive the write,
++         * so the guest could never turn the alarm off.
++         */
+         s->rtsr = (value & (RTSR_ALE | RTSR_HZE)) |
+-                  (s->rtsr & ~(value & (RTSR_AL | RTSR_HZ)));
++                  (s->rtsr & (RTSR_AL | RTSR_HZ) & ~value);
+ 
+         if (s->rtsr != old_rtsr) {
+             strongarm_rtc_timer_update(s);
