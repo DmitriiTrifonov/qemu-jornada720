@@ -2,8 +2,9 @@
 /*
  * Router for the PHP server run.sh starts next to the emulator: /files/
  * lists and hands out the host folder J720_FILES (default ~/jornada-files)
- * so Pocket IE can download programs and documents into CE; everything
- * else goes to FrogFind in the document root.
+ * so Pocket IE can download programs and documents into CE, and takes
+ * uploads from CE through a form; everything else goes to FrogFind in the
+ * document root.
  */
 $uri = rawurldecode(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH));
 
@@ -23,6 +24,18 @@ $path = $root === false ? false : realpath($root . '/' . substr($uri, 7));
 if ($path === false || ($path !== $root && strncmp($path, $root . '/', strlen($root) + 1) !== 0)) {
     http_response_code(404);
     echo "<html><body>Not found</body></html>";
+    return true;
+}
+
+/* upload from CE into this folder (multipart form below the listing) */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && is_dir($path)) {
+    $f = $_FILES['f'] ?? null;
+    $name = $f ? basename(str_replace('\\', '/', $f['name'])) : '';
+    if ($f && $f['error'] === UPLOAD_ERR_OK && $name !== '' && $name[0] !== '.') {
+        move_uploaded_file($f['tmp_name'], "$path/$name");
+    }
+    header('Location: ' . $_SERVER['REQUEST_URI']);
+    http_response_code(303);
     return true;
 }
 
@@ -53,5 +66,8 @@ foreach ($names as $name) {
     $size = $dir ? '' : ' (' . max(1, (int)ceil(filesize($full) / 1024)) . ' KB)';
     echo "<a href=\"$href\">" . htmlspecialchars($name) . ($dir ? '/' : '') . "</a>$size<br>\n";
 }
+echo "<hr><form method=\"post\" enctype=\"multipart/form-data\">\n";
+echo "Send a file here: <input type=\"file\" name=\"f\">\n";
+echo "<input type=\"submit\" value=\"Upload\"></form>\n";
 echo "</body></html>\n";
 return true;
