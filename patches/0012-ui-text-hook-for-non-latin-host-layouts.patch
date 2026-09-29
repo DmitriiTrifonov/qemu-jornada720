@@ -1,0 +1,117 @@
+diff --git a/include/ui/input.h b/include/ui/input.h
+--- a/include/ui/input.h
++++ b/include/ui/input.h
+@@ -55,6 +55,17 @@
+                              const char *device_id, int head,
+                              Error **errp);
+ void qemu_input_event_send(QemuConsole *src, QemuInputEvent *evt);
++
++/*
++ * qemu-jornada720: characters the host keyboard layout produces that the
++ * guest's own layout cannot (e.g. Cyrillic), as Unicode code points, for
++ * a board that can type them some other way. The SDL UI sends such keys
++ * here instead of as key events while a hook is set.
++ */
++typedef void QemuInputTextHook(void *opaque, uint32_t codepoint);
++void qemu_input_set_text_hook(QemuInputTextHook *hook, void *opaque);
++bool qemu_input_text_hook_active(void);
++void qemu_input_send_text(uint32_t codepoint);
+ void qemu_input_event_send_impl(QemuConsole *src, QemuInputEvent *evt);
+ void qemu_input_event_sync(void);
+ void qemu_input_event_sync_impl(void);
+diff --git a/ui/input.c b/ui/input.c
+--- a/ui/input.c
++++ b/ui/input.c
+@@ -714,3 +714,25 @@
+     }
+     g_free(up);
+ }
++
++static QemuInputTextHook *text_hook;
++static void *text_hook_opaque;
++
++void qemu_input_set_text_hook(QemuInputTextHook *hook, void *opaque)
++{
++    text_hook = hook;
++    text_hook_opaque = opaque;
++}
++
++bool qemu_input_text_hook_active(void)
++{
++    return text_hook != NULL;
++}
++
++void qemu_input_send_text(uint32_t codepoint)
++{
++    if (text_hook && (runstate_is_running() ||
++                      runstate_check(RUN_STATE_SUSPENDED))) {
++        text_hook(text_hook_opaque, codepoint);
++    }
++}
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -395,6 +395,28 @@
+     }
+ }
+ 
++/*
++ * qemu-jornada720: with a text hook set (see qemu_input_set_text_hook),
++ * printable keys go to the guest as the characters the host layout makes
++ * of them when that layout is not Latin (e.g. Russian), so the guest
++ * need not have that layout itself. Shortcuts with Ctrl/Alt/Super, space
++ * and non-printing keys still go as key events.
++ */
++static bool sdl2_text_routed;
++
++static bool sdl2_route_as_text(SDL_KeyboardEvent *key)
++{
++    SDL_Keycode sym = SDL_GetKeyFromScancode(key->keysym.scancode);
++    bool latin = SDL_GetKeyFromScancode(SDL_SCANCODE_A) < 0x80;
++
++    if (!qemu_input_text_hook_active() ||
++        (key->keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI)) ||
++        (sym & SDLK_SCANCODE_MASK) || sym <= 0x20 || sym == 0x7f) {
++        return false;
++    }
++    return sym >= 0xa0 || !latin;
++}
++
+ static void handle_keydown(SDL_Event *ev)
+ {
+     int win;
+@@ -489,7 +511,8 @@
+             break;
+         }
+     }
+-    if (!scon->gui_keysym) {
++    sdl2_text_routed = !scon->gui_keysym && sdl2_route_as_text(&ev->key);
++    if (!scon->gui_keysym && !sdl2_text_routed) {
+         sdl2_process_key(scon, &ev->key);
+     }
+ }
+@@ -517,7 +540,24 @@
+ 
+     if (!scon->gui_keysym && QEMU_IS_TEXT_CONSOLE(con)) {
+         qemu_text_console_put_string(QEMU_TEXT_CONSOLE(con), ev->text.text, strlen(ev->text.text));
++    } else if (qemu_input_text_hook_active() &&
++               g_utf8_validate(ev->text.text, -1, NULL)) {
++        /*
++         * qemu-jornada720: see sdl2_route_as_text(). Non-ASCII text always
++         * goes this way: some sources (virtual keyboards) send it with no
++         * key event the guest could have used instead.
++         */
++        const char *p;
++
++        for (p = ev->text.text; *p; p = g_utf8_next_char(p)) {
++            gunichar cp = g_utf8_get_char(p);
++
++            if (sdl2_text_routed || cp >= 0xa0) {
++                qemu_input_send_text(cp);
++            }
++        }
+     }
++    sdl2_text_routed = false;
+ }
+ 
+ /*

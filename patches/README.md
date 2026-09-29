@@ -23,6 +23,7 @@ git apply ../patches/0008-sa1110-c15-idle-wfi.patch
 git apply ../patches/0009-sdl2-no-grab-for-absolute-pointer-ctrl-alt-q.patch
 git apply ../patches/0010-sdl2-window-close-honours-shutdown-action.patch
 git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
+git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
@@ -86,3 +87,10 @@ git apply ../patches/0011-strongarm-rtc-rtsr-enables-and-alarm-overflow.patch
   прерываний (~4000 IRQ/с против ~100): CE сбрасывал будильник, тот
   тут же срабатывал снова, ввод тормозил на секунды. Теперь сроки
   считаются в 64 битах от текущего RCNR.
+- `0012-...` — `ui/input.c`, `include/ui/input.h`, `ui/sdl2.c` (после
+  `0010`): хук `qemu_input_set_text_hook()` для символов, которые даёт
+  раскладка хоста, но не раскладка гостя. Пока он установлен, SDL
+  отправляет печатные клавиши не кодами, а символами из `SDL_TEXTINPUT`,
+  если раскладка хоста не латинская (или клавиша даёт не-ASCII символ);
+  Ctrl/Alt/Super-сочетания, пробел и служебные клавиши — как раньше.
+  Плата Jornada набирает такие символы в CE через Alt + десятичный код.

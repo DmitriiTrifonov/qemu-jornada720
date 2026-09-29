@@ -187,6 +187,11 @@ static const MemoryRegionOps j720_pm_posr_stub_ops = {
 #define J720_GPIO_TS_IRQ    9
 
 #define J720_MCU_KEYQ       16
+/* GETSCANKEYCODE sends a count byte, then the codes, all through out[16] */
+#define J720_MCU_KEYQ_USE   (J720_MCU_KEYQ - 1)
+#define J720_MCU_PEND       64
+#define J720_MCU_PEND_RAW   0x80000000u
+#define J720_MCU_KBD_DELAY_MS 5
 #define J720_MCU_BATT_MAIN   0x2a0
 #define J720_MCU_BATT_BACKUP 0x3c0
 #define J720_MCU_TS_PERIOD_MS 10
@@ -232,6 +237,14 @@ struct J720MCUState {
     uint8_t keyq[J720_MCU_KEYQ];
     int keyq_len;
     uint8_t keydown[128 / 8];   /* modifier key codes currently held */
+    /*
+     * Keys and characters waiting for room in keyq (not migrated): a
+     * character is typed as one Alt+digits sequence, which must not be
+     * split. Entries: J720_MCU_PEND_RAW | code, or a Unicode code point.
+     */
+    uint32_t pend[J720_MCU_PEND];
+    int pend_head, pend_len;
+    QEMUTimer *kbd_timer;       /* hands out pend a little after a read */
 
     bool pen_down;
     bool pen_up_pending;        /* released before enough samples were read */
@@ -270,6 +283,8 @@ static uint8_t j720_mcu_high_bits(int v)
     return v | v << 2 | v << 4;
 }
 
+static void j720_mcu_drain(J720MCUState *s);
+
 static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
 {
     int i;
@@ -301,6 +316,14 @@ static uint8_t j720_mcu_byte(J720MCUState *s, uint8_t c)
         }
         s->keyq_len = 0;
         qemu_irq_raise(s->kbd_irq);
+        /*
+         * Not right away: CE acknowledges the GPIO0 edge after reading,
+         * which would swallow one made during the read.
+         */
+        if (s->pend_len) {
+            timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      J720_MCU_KBD_DELAY_MS);
+        }
         break;
     case J720_MCU_GETTOUCHSAMPLES:
         s->pen_samples++;
@@ -344,14 +367,118 @@ static uint32_t j720_mcu_transfer(SSIPeripheral *dev, uint32_t val)
     return j720_bitrev8(j720_mcu_byte(s, j720_bitrev8(val)));
 }
 
-static bool j720_mcu_key_queue(J720MCUState *s, uint8_t b)
+static int j720_mcu_code(unsigned int lnx)
 {
-    if (s->keyq_len == J720_MCU_KEYQ) {
+    int code;
+
+    for (code = 1; code < 128; code++) {
+        if (j720_keymap[code] == lnx) {
+            return code;
+        }
+    }
+    return 0;
+}
+
+static bool j720_mcu_held(J720MCUState *s, int code)
+{
+    return code && (s->keydown[code / 8] & (1 << code % 8));
+}
+
+/*
+ * CE's keyboard driver (TSCkbdr.dll) turns Alt + decimal digits into the
+ * character with that code once Alt goes up, Unicode included. That is
+ * how characters the ROM's US layout cannot make (Cyrillic, from the host
+ * layout) get typed. Shift is lifted around the sequence.
+ */
+static int j720_mcu_char_codes(J720MCUState *s, uint32_t cp, uint8_t *out)
+{
+    static const unsigned int digit[10] = {
+        KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9
+    };
+    int alt = j720_mcu_code(KEY_LEFTALT);
+    int shifts[2] = { j720_mcu_code(KEY_LEFTSHIFT),
+                      j720_mcu_code(KEY_RIGHTSHIFT) };
+    char dec[12];
+    int n = 0, i;
+
+    snprintf(dec, sizeof(dec), "%02u", cp);    /* at least two digits */
+    for (i = 0; i < 2; i++) {
+        if (j720_mcu_held(s, shifts[i])) {
+            out[n++] = shifts[i] | 0x80;
+        }
+    }
+    out[n++] = alt;
+    for (i = 0; dec[i]; i++) {
+        int code = j720_mcu_code(digit[dec[i] - '0']);
+        out[n++] = code;
+        out[n++] = code | 0x80;
+    }
+    out[n++] = alt | 0x80;
+    for (i = 0; i < 2; i++) {
+        if (j720_mcu_held(s, shifts[i])) {
+            out[n++] = shifts[i];
+        }
+    }
+    return n;
+}
+
+/* Move whatever fits from pend into keyq, keeping sequences whole */
+static void j720_mcu_drain(J720MCUState *s)
+{
+    uint8_t seq[J720_MCU_KEYQ];
+    bool added = false;
+
+    while (s->pend_len) {
+        uint32_t e = s->pend[s->pend_head];
+        int n;
+
+        if (e & J720_MCU_PEND_RAW) {
+            seq[0] = e;
+            n = 1;
+        } else if (e > 99999) {
+            n = 0;                          /* CE takes at most 5 digits */
+        } else {
+            n = j720_mcu_char_codes(s, e, seq);
+        }
+        if (s->keyq_len + n > J720_MCU_KEYQ_USE) {
+            break;
+        }
+        memcpy(s->keyq + s->keyq_len, seq, n);
+        s->keyq_len += n;
+        added |= n > 0;
+        s->pend_head = (s->pend_head + 1) % J720_MCU_PEND;
+        s->pend_len--;
+    }
+    if (added) {
+        qemu_irq_lower(s->kbd_irq);
+    }
+}
+
+static bool j720_mcu_pend(J720MCUState *s, uint32_t e)
+{
+    if (s->pend_len == J720_MCU_PEND) {
         return false;
     }
-    s->keyq[s->keyq_len++] = b;
-    qemu_irq_lower(s->kbd_irq);
+    s->pend[(s->pend_head + s->pend_len++) % J720_MCU_PEND] = e;
+    if (!timer_pending(s->kbd_timer)) {
+        j720_mcu_drain(s);
+    }
     return true;
+}
+
+static void j720_mcu_kbd_tick(void *opaque)
+{
+    j720_mcu_drain(opaque);
+}
+
+static bool j720_mcu_key_queue(J720MCUState *s, uint8_t b)
+{
+    return j720_mcu_pend(s, J720_MCU_PEND_RAW | b);
+}
+
+static void j720_mcu_text(void *opaque, uint32_t codepoint)
+{
+    j720_mcu_pend(opaque, codepoint);
 }
 
 /*
@@ -377,12 +504,8 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
     } else if (lnx == KEY_RIGHTALT) {
         lnx = KEY_LEFTALT;
     }
-    for (code = 1; code < 128; code++) {
-        if (j720_keymap[code] == lnx) {
-            break;
-        }
-    }
-    if (code == 128) {
+    code = j720_mcu_code(lnx);
+    if (!code) {
         return;
     }
 
@@ -397,7 +520,7 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
         }
         break;
     default:
-        if (down && s->keyq_len + 2 <= J720_MCU_KEYQ) {
+        if (down && s->pend_len + 2 <= J720_MCU_PEND) {
             j720_mcu_key_queue(s, code);
             j720_mcu_key_queue(s, code | 0x80);
         }
@@ -506,11 +629,13 @@ static void j720_mcu_realize(SSIPeripheral *dev, Error **errp)
     s->contrast = 0x80;
     s->brightness = 0x80;
     s->ts_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, j720_mcu_ts_tick, s);
+    s->kbd_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, j720_mcu_kbd_tick, s);
     s->debug = getenv("J720_TOUCH_DEBUG") != NULL;
     hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_kbd_handler);
     qemu_input_handler_activate(hs);
     hs = qemu_input_handler_register(DEVICE(dev), &j720_mcu_ts_handler);
     qemu_input_handler_activate(hs);
+    qemu_input_set_text_hook(j720_mcu_text, s);
 }
 
 static int j720_mcu_post_load(void *opaque, int version_id)
