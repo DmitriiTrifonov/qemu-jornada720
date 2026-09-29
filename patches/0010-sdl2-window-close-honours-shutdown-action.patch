@@ -1,7 +1,7 @@
 diff --git a/ui/sdl2.c b/ui/sdl2.c
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
-@@ -695,7 +695,11 @@
+@@ -700,7 +700,11 @@
                  allow_close = false;
              }
              if (allow_close) {
@@ -14,7 +14,7 @@ diff --git a/ui/sdl2.c b/ui/sdl2.c
                  qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
              }
          } else {
-@@ -742,7 +746,7 @@
+@@ -747,7 +751,7 @@
                  allow_close = false;
              }
              if (allow_close) {

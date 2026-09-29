@@ -30,14 +30,19 @@ diff --git a/ui/sdl2.c b/ui/sdl2.c
      } else {
          return (mod & gui_grab_code) == gui_grab_code;
      }
-@@ -422,6 +437,11 @@
+@@ -422,6 +437,16 @@
              break;
          case SDL_SCANCODE_F:
              toggle_full_screen(scon);
 +            scon->gui_keysym = true;
 +            break;
 +        case SDL_SCANCODE_Q:
-+            /* qemu-jornada720: quit, like the GTK UI's Ctrl+Alt+Q */
++            /*
++             * qemu-jornada720: quit, like the GTK UI's Ctrl+Alt+Q; let
++             * the guest see Ctrl and Alt go up first, it may be saved
++             * and resumed
++             */
++            sdl2_release_modifiers(scon);
 +            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
              scon->gui_keysym = true;
              break;

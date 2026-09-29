@@ -224,6 +224,7 @@ struct J720MCUState {
 
     uint8_t keyq[J720_MCU_KEYQ];
     int keyq_len;
+    uint8_t keydown[128 / 8];   /* modifier key codes currently held */
 
     bool pen_down;
     bool pen_up_pending;        /* released before enough samples were read */
@@ -336,23 +337,65 @@ static uint32_t j720_mcu_transfer(SSIPeripheral *dev, uint32_t val)
     return j720_bitrev8(j720_mcu_byte(s, j720_bitrev8(val)));
 }
 
+static bool j720_mcu_key_queue(J720MCUState *s, uint8_t b)
+{
+    if (s->keyq_len == J720_MCU_KEYQ) {
+        return false;
+    }
+    s->keyq[s->keyq_len++] = b;
+    qemu_irq_lower(s->kbd_irq);
+    return true;
+}
+
+/*
+ * The real MCU reports make and break codes and CE does its own
+ * autorepeat, timed by its clock. Under -icount that clock runs fast
+ * (~12x with the default shift=6), so even a quick key press repeated
+ * in CE. Instead, every key-down of an ordinary key, the host's own
+ * autorepeat included, becomes a complete make+break press; only
+ * modifiers are held for real.
+ */
 static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
                                QemuInputEvent *evt)
 {
     J720MCUState *s = J720_MCU(dev);
     unsigned int lnx = evt->key.key;    /* Linux key code */
+    bool down = evt->key.down;
+    bool held;
     int code;
 
+    /* the Jornada has only left Ctrl and Alt */
+    if (lnx == KEY_RIGHTCTRL) {
+        lnx = KEY_LEFTCTRL;
+    } else if (lnx == KEY_RIGHTALT) {
+        lnx = KEY_LEFTALT;
+    }
     for (code = 1; code < 128; code++) {
         if (j720_keymap[code] == lnx) {
             break;
         }
     }
-    if (code == 128 || s->keyq_len == J720_MCU_KEYQ) {
+    if (code == 128) {
         return;
     }
-    s->keyq[s->keyq_len++] = code | (evt->key.down ? 0 : 0x80);
-    qemu_irq_lower(s->kbd_irq);
+
+    switch (lnx) {
+    case KEY_LEFTSHIFT:
+    case KEY_RIGHTSHIFT:
+    case KEY_LEFTCTRL:
+    case KEY_LEFTALT:
+        held = s->keydown[code / 8] & (1 << code % 8);
+        if (held != down && j720_mcu_key_queue(s, code | (down ? 0 : 0x80))) {
+            s->keydown[code / 8] ^= 1 << code % 8;
+        }
+        break;
+    default:
+        if (down && s->keyq_len + 2 <= J720_MCU_KEYQ) {
+            j720_mcu_key_queue(s, code);
+            j720_mcu_key_queue(s, code | 0x80);
+        }
+        break;
+    }
 }
 
 static void j720_mcu_pen_up(J720MCUState *s)
@@ -475,6 +518,24 @@ static int j720_mcu_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool j720_mcu_keydown_needed(void *opaque)
+{
+    J720MCUState *s = opaque;
+
+    return !buffer_is_zero(s->keydown, sizeof(s->keydown));
+}
+
+static const VMStateDescription vmstate_j720_mcu_keydown = {
+    .name = TYPE_J720_MCU "/keydown",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = j720_mcu_keydown_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(keydown, J720MCUState, 128 / 8),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_j720_mcu = {
     .name = TYPE_J720_MCU,
     .version_id = 1,
@@ -497,6 +558,10 @@ static const VMStateDescription vmstate_j720_mcu = {
         VMSTATE_INT32(pen_y, J720MCUState),
         VMSTATE_TIMER_PTR(ts_timer, J720MCUState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_j720_mcu_keydown,
+        NULL
     }
 };
 
