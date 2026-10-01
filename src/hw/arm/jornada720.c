@@ -11,6 +11,9 @@
  *   0x1a000000  debug board CL-CD1284 UART  -- unimplemented-device stub
  *   0x20000000  PCMCIA socket 0 I/O         -- NE2000 network card
  *   0x28000000  PCMCIA socket 0 attribute   -- the card's CIS and COR
+ *   0x30000000  PCMCIA socket 1 (CF slot)   -- CompactFlash storage card
+ *                                           (I/O, attribute at 0x38000000,
+ *                                           common memory at 0x3c000000)
  *   0x40000000  SA-1111 companion chip      (SA_CS4) -- interrupt controller
  *                                           and PCMCIA interface; the rest
  *                                           is an unimplemented-device stub
@@ -44,6 +47,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/net/ne2000.h"
 #include "net/net.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "migration/vmstate.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "system/address-spaces.h"
@@ -1303,8 +1308,9 @@ static const MemoryRegionOps j720_udc_ops = {
 
 /*
  * SA-1111 companion chip: interrupt controller and PCMCIA interface,
- * with an NE2000-compatible network PC Card in socket 0 (the CF slot,
- * socket 1, stays empty). Register layout from Linux
+ * with an NE2000-compatible network PC Card in socket 0 and a
+ * CompactFlash storage card in socket 1, the CF slot (see "CF card"
+ * below). Register layout from Linux
  * (arch/arm/common/sa1111.c, drivers/pcmcia/sa1111_generic.c); the rest
  * of the chip is still the unimplemented-device stub underneath.
  *
@@ -1341,6 +1347,14 @@ static const MemoryRegionOps j720_udc_ops = {
 
 /* interrupt numbers 32..63 live in bank 1 */
 #define SA1111_IRQ_S0_READY_NINT (49 - 32)
+#define SA1111_IRQ_S1_READY_NINT (50 - 32)
+#define SA1111_IRQ_S0_CD_VALID   (51 - 32)
+#define SA1111_IRQ_S1_CD_VALID   (52 - 32)
+/* bank 1 inputs this model drives; the others' levels are unknown */
+#define SA1111_INPUTS1          (1u << SA1111_IRQ_S0_READY_NINT | \
+                                 1u << SA1111_IRQ_S1_READY_NINT | \
+                                 1u << SA1111_IRQ_S0_CD_VALID | \
+                                 1u << SA1111_IRQ_S1_CD_VALID)
 
 #define SA1111_PCCR             0x00
 #define SA1111_PCSSR            0x04
@@ -1358,6 +1372,7 @@ static const MemoryRegionOps j720_udc_ops = {
 #define PCSR_S1_BVD1            (1 << 12)
 #define PCSR_S1_BVD2            (1 << 13)
 #define PCCR_S0_RST             (1 << 0)
+#define PCCR_S1_RST             (1 << 1)
 
 #define J720_CARD_COR           0x3f8       /* attribute memory offsets */
 #define J720_CARD_CCSR          0x3fa
@@ -1365,6 +1380,71 @@ static const MemoryRegionOps j720_udc_ops = {
 #define COR_SRESET              0x80
 #define COR_INDEX_MASK          0x3f
 #define CCSR_INTR               0x02
+
+/*
+ * CF card: a CompactFlash storage card (PC Card ATA) in socket 1. The
+ * ROM has ATADISK.DLL and FATFS.DLL, which mount it as \Storage Card.
+ * Its medium is the block backend "cf", which may be empty: QEMU's
+ * eject/change commands (HMP "change cf FILE raw", "eject cf"; QMP
+ * blockdev-change-medium, eject) take the card out of the slot and put
+ * one in, and the SA-1111 card-detect interrupt (IRQ 52, S1_CD_VALID,
+ * low while a card is in) tells CE. A read-only medium, such as a host
+ * directory as "fat:16:DIR" with read-only=on, makes a card that
+ * fails writes.
+ *
+ * The card follows the CompactFlash spec: CIS with a fixed-disk FUNCID
+ * and four configurations (0: memory mapped, the state after reset;
+ * 1: 16 I/O ports anywhere; 2/3: the primary/secondary ATA ports), the
+ * configuration registers at 0x200 of attribute memory, and the ATA
+ * task file. Commands run synchronously, PIO only, one sector per DRQ
+ * block. In an I/O configuration the card's INTRQ drives READY, which
+ * the SA-1111 sees as IRQ 50 (S1_READY_NINT), like the NE2000 above.
+ */
+#define J720_PCMCIA_S1_IO       0x30000000
+#define J720_PCMCIA_S1_ATTR     0x38000000
+#define J720_PCMCIA_S1_MEM      0x3c000000
+
+#define J720_CF_COR             0x200       /* attribute memory offsets */
+#define J720_CF_CCSR            0x202
+#define J720_CF_SECTOR          512
+
+#define ATA_SR_ERR              0x01
+#define ATA_SR_DRQ              0x08
+#define ATA_SR_DSC              0x10
+#define ATA_SR_DRDY             0x40
+#define ATA_SR_BSY              0x80
+#define ATA_ER_ABRT             0x04
+#define ATA_ER_IDNF             0x10
+#define ATA_ER_UNC              0x40
+#define ATA_DC_NIEN             0x02
+#define ATA_DC_SRST             0x04
+#define ATA_DH_DEV              0x10
+#define ATA_DH_LBA              0x40
+
+/* how long a card resumed in the slot stays out before going in again */
+#define J720_CF_REPLUG_MS       3000
+
+typedef struct J720CFCard {
+    BlockBackend *blk;
+    QEMUTimer *resume_timer;
+    bool inserted;
+    bool writable;              /* the medium takes writes */
+    uint64_t nb_sectors;        /* from the medium, not migrated */
+    uint16_t cyls, heads, secs; /* current CHS translation */
+
+    uint8_t cor, ccsr;
+    bool intrq;
+
+    /* ATA task file */
+    uint8_t feature, error, nsector, sector, lcyl, hcyl, select;
+    uint8_t status, devctl, cmd;
+
+    /* PIO transfer: buf[pos..end), then xfer_left more sectors */
+    uint8_t buf[J720_CF_SECTOR];
+    uint32_t pos, end;
+    uint32_t xfer_left;
+    uint64_t lba;               /* sector in buf (write) / next (read) */
+} J720CFCard;
 
 #define TYPE_J720_SA1111 "j720-sa1111"
 OBJECT_DECLARE_SIMPLE_TYPE(J720SA1111State, J720_SA1111)
@@ -1376,6 +1456,9 @@ struct J720SA1111State {
     MemoryRegion pcmcia_io;
     MemoryRegion card_io;
     MemoryRegion card_attr;
+    MemoryRegion cf_io;
+    MemoryRegion cf_attr;
+    MemoryRegion cf_mem;
     qemu_irq irq;               /* to SA-1110 GPIO1 */
 
     uint32_t inten[2], intpol[2], intstat[2], wakeen[2], wakepol[2];
@@ -1387,6 +1470,8 @@ struct J720SA1111State {
     uint8_t cis[128];
     int cis_len;
     NE2000State ne2000;
+
+    J720CFCard cf;
 };
 
 static void j720_sa1111_update(J720SA1111State *s)
@@ -1395,7 +1480,23 @@ static void j720_sa1111_update(J720SA1111State *s)
                          (s->intstat[1] & s->inten[1]));
 }
 
-/* Interrupt inputs are edge-detected; INTPOL set = falling edge */
+/*
+ * Interrupt inputs are edge-detected: a rising edge of the input XOR its
+ * INTPOL bit (set = falling edge) latches it. So flipping INTPOL is an
+ * edge too, and CE relies on that for card detect, as Linux does in
+ * sa1111_retrigger_irq().
+ */
+static void j720_sa1111_set_intpol(J720SA1111State *s, int bank,
+                                   uint32_t pol)
+{
+    uint32_t known = bank ? SA1111_INPUTS1 : 0;
+    uint32_t old = s->intin[bank] ^ s->intpol[bank];
+    uint32_t new = s->intin[bank] ^ pol;
+
+    s->intpol[bank] = pol;
+    s->intstat[bank] |= ~old & new & known;
+}
+
 static void j720_sa1111_set_input(J720SA1111State *s, int bank, int bit,
                                   bool level)
 {
@@ -1436,6 +1537,657 @@ static void j720_card_ne2000_irq(void *opaque, int n, int level)
     j720_card_update(s);
 }
 
+/* CF card */
+
+static bool j720_cf_ready(J720SA1111State *s)
+{
+    J720CFCard *cf = &s->cf;
+
+    if (!cf->inserted || (s->pccr & PCCR_S1_RST)) {
+        return false;
+    }
+    /* once configured as an I/O card, READY carries nIREQ */
+    return !((cf->cor & COR_INDEX_MASK) && cf->intrq &&
+             !(cf->devctl & ATA_DC_NIEN));
+}
+
+static void j720_cf_update(J720SA1111State *s)
+{
+    j720_sa1111_set_input(s, 1, SA1111_IRQ_S1_READY_NINT, j720_cf_ready(s));
+}
+
+static void j720_cf_set_intrq(J720SA1111State *s, bool level)
+{
+    J720CFCard *cf = &s->cf;
+
+    cf->intrq = level;
+    cf->ccsr = level ? cf->ccsr | CCSR_INTR : cf->ccsr & ~CCSR_INTR;
+    j720_cf_update(s);
+}
+
+static void j720_cf_default_geometry(J720CFCard *cf)
+{
+    uint64_t cyls;
+
+    cf->heads = 16;
+    cf->secs = 63;
+    cyls = cf->nb_sectors / (cf->heads * cf->secs);
+    cf->cyls = MAX(1, MIN(cyls, 16383));
+}
+
+/* the ATA reset signature, after a hardware or software reset */
+static void j720_cf_ata_reset(J720SA1111State *s)
+{
+    J720CFCard *cf = &s->cf;
+
+    cf->error = 0x01;               /* diagnostics passed */
+    cf->nsector = cf->sector = 1;
+    cf->lcyl = cf->hcyl = 0;
+    cf->select = 0xa0;
+    cf->feature = cf->cmd = 0;
+    cf->status = ATA_SR_DRDY | ATA_SR_DSC;
+    cf->pos = cf->end = cf->xfer_left = 0;
+    j720_cf_default_geometry(cf);
+    j720_cf_set_intrq(s, false);
+}
+
+static void j720_cf_reset(J720SA1111State *s)
+{
+    s->cf.cor = s->cf.ccsr = 0;
+    s->cf.devctl = 0;
+    j720_cf_ata_reset(s);
+}
+
+static void j720_cf_set_inserted(J720SA1111State *s, bool inserted)
+{
+    J720CFCard *cf = &s->cf;
+    int64_t len = inserted ? blk_getlength(cf->blk) : 0;
+
+    cf->inserted = inserted;
+    cf->nb_sectors = MAX(len, 0) / J720_CF_SECTOR;
+    j720_cf_reset(s);
+    /* card detect is active low */
+    j720_sa1111_set_input(s, 1, SA1111_IRQ_S1_CD_VALID, !inserted);
+}
+
+/* write access when the medium allows it; a read-only card rejects writes */
+static void j720_cf_set_perm(J720CFCard *cf)
+{
+    cf->writable = blk_is_inserted(cf->blk) &&
+                   blk_supports_write_perm(cf->blk) &&
+                   blk_set_perm(cf->blk,
+                                BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                                BLK_PERM_ALL, NULL) == 0;
+    if (!cf->writable) {
+        blk_set_perm(cf->blk, BLK_PERM_CONSISTENT_READ, BLK_PERM_ALL, NULL);
+    }
+}
+
+static void j720_cf_change_media_cb(void *opaque, bool load, Error **errp)
+{
+    J720SA1111State *s = opaque;
+
+    j720_cf_set_perm(&s->cf);
+    if (load != s->cf.inserted) {
+        j720_cf_set_inserted(s, load);
+    }
+}
+
+static void j720_cf_resume_timer(void *opaque)
+{
+    J720SA1111State *s = opaque;
+    bool medium = blk_is_inserted(s->cf.blk);
+
+    if (s->cf.inserted) {
+        j720_cf_set_inserted(s, false);
+        if (medium) {
+            timer_mod(s->cf.resume_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      J720_CF_REPLUG_MS);
+        }
+    } else if (medium) {
+        j720_cf_set_inserted(s, true);
+    }
+}
+
+static const BlockDevOps j720_cf_block_ops = {
+    .change_media_cb = j720_cf_change_media_cb,
+};
+
+static void j720_cf_put_string(uint16_t *id, const char *str, int words)
+{
+    int i;
+
+    for (i = 0; i < words * 2; i++) {
+        uint8_t c = *str ? *str++ : ' ';
+        id[i / 2] |= (i & 1) ? c : c << 8;
+    }
+}
+
+static void j720_cf_identify(J720CFCard *cf)
+{
+    uint16_t id[256] = { 0 };
+    uint32_t cur = cf->cyls * cf->heads * cf->secs;
+    uint32_t total = MIN(cf->nb_sectors, 0x0fffffff);
+    int i;
+
+    id[0] = 0x848a;                 /* CFA */
+    id[1] = cf->cyls;
+    id[3] = cf->heads;
+    id[6] = cf->secs;
+    id[7] = total >> 16;            /* sectors per card, MSW first */
+    id[8] = total;
+    j720_cf_put_string(&id[10], "QEMU0720CF", 10);
+    id[20] = 2;                     /* dual-ported buffer */
+    id[21] = 2;                     /* buffer size in sectors */
+    id[22] = 4;                     /* ECC bytes */
+    j720_cf_put_string(&id[23], "1.0", 4);
+    j720_cf_put_string(&id[27], "QEMU CompactFlash Card", 20);
+    id[47] = 0x8001;                /* READ/WRITE MULTIPLE: 1 sector */
+    id[49] = 0x0200;                /* LBA */
+    id[51] = 0x0200;                /* PIO mode 2 */
+    id[53] = 0x0001;                /* words 54-58 valid */
+    id[54] = cf->cyls;
+    id[55] = cf->heads;
+    id[56] = cf->secs;
+    id[57] = cur;
+    id[58] = cur >> 16;
+    id[60] = total;
+    id[61] = total >> 16;
+    for (i = 0; i < 256; i++) {
+        stw_le_p(&cf->buf[i * 2], id[i]);
+    }
+}
+
+/* the sector the task file addresses, or -1 if it is not on the card */
+static int64_t j720_cf_task_lba(J720CFCard *cf)
+{
+    uint64_t lba;
+    unsigned cyl = cf->hcyl << 8 | cf->lcyl, head = cf->select & 0x0f;
+
+    if (cf->select & ATA_DH_LBA) {
+        lba = (uint64_t)head << 24 | cf->hcyl << 16 | cf->lcyl << 8 |
+              cf->sector;
+    } else {
+        if (!cf->sector || cf->sector > cf->secs || head >= cf->heads ||
+            cyl >= cf->cyls) {
+            return -1;
+        }
+        lba = ((uint64_t)cyl * cf->heads + head) * cf->secs +
+              cf->sector - 1;
+    }
+    return lba < cf->nb_sectors ? lba : -1;
+}
+
+/* point the task file at a sector, as ATA leaves it after a transfer */
+static void j720_cf_set_task_lba(J720CFCard *cf, uint64_t lba)
+{
+    unsigned cyl, head;
+
+    if (cf->select & ATA_DH_LBA) {
+        cf->select = (cf->select & 0xf0) | ((lba >> 24) & 0x0f);
+        cf->hcyl = lba >> 16;
+        cf->lcyl = lba >> 8;
+        cf->sector = lba;
+        return;
+    }
+    cyl = lba / (cf->heads * cf->secs);
+    head = (lba / cf->secs) % cf->heads;
+    cf->select = (cf->select & 0xf0) | head;
+    cf->hcyl = cyl >> 8;
+    cf->lcyl = cyl;
+    cf->sector = lba % cf->secs + 1;
+}
+
+static void j720_cf_done(J720SA1111State *s, uint8_t error)
+{
+    J720CFCard *cf = &s->cf;
+
+    cf->error = error;
+    cf->status = ATA_SR_DRDY | ATA_SR_DSC | (error ? ATA_SR_ERR : 0);
+    cf->pos = cf->end = cf->xfer_left = 0;
+    j720_cf_set_intrq(s, true);
+}
+
+/* PIO in: the next sector into the buffer, DRQ and an interrupt */
+static void j720_cf_read_sector(J720SA1111State *s)
+{
+    J720CFCard *cf = &s->cf;
+
+    if (blk_pread(cf->blk, cf->lba * J720_CF_SECTOR, J720_CF_SECTOR,
+                  cf->buf, 0) < 0) {
+        j720_cf_done(s, ATA_ER_UNC);
+        return;
+    }
+    j720_cf_set_task_lba(cf, cf->lba);
+    cf->lba++;
+    cf->nsector--;
+    cf->xfer_left--;
+    cf->pos = 0;
+    cf->end = J720_CF_SECTOR;
+    cf->status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+    j720_cf_set_intrq(s, true);
+}
+
+/* PIO out: the host has filled the buffer */
+static void j720_cf_write_sector(J720SA1111State *s)
+{
+    J720CFCard *cf = &s->cf;
+
+    if (blk_pwrite(cf->blk, cf->lba * J720_CF_SECTOR, J720_CF_SECTOR,
+                   cf->buf, 0) < 0) {
+        j720_cf_done(s, ATA_ER_UNC);
+        return;
+    }
+    j720_cf_set_task_lba(cf, cf->lba);
+    cf->lba++;
+    cf->nsector--;
+    if (--cf->xfer_left == 0) {
+        j720_cf_done(s, 0);
+        return;
+    }
+    cf->pos = 0;
+    cf->status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+    j720_cf_set_intrq(s, true);
+}
+
+/* buffer fully read or written by the host */
+static void j720_cf_buffer_done(J720SA1111State *s)
+{
+    J720CFCard *cf = &s->cf;
+
+    switch (cf->cmd) {
+    case 0x20: case 0x21: case 0xc4:
+        if (cf->xfer_left) {
+            j720_cf_read_sector(s);
+            return;
+        }
+        break;
+    case 0x30: case 0x31: case 0x38: case 0xc5:
+        j720_cf_write_sector(s);
+        return;
+    }
+    cf->pos = cf->end = 0;
+    cf->status = ATA_SR_DRDY | ATA_SR_DSC;
+}
+
+static void j720_cf_command(J720SA1111State *s, uint8_t cmd)
+{
+    J720CFCard *cf = &s->cf;
+    unsigned count = cf->nsector ? cf->nsector : 256;
+    int64_t lba;
+
+    if (cf->select & ATA_DH_DEV) {
+        return;                     /* no drive 1 */
+    }
+    cf->cmd = cmd;
+    cf->pos = cf->end = cf->xfer_left = 0;
+    j720_cf_set_intrq(s, false);
+
+    switch (cmd) {
+    case 0xec:                      /* IDENTIFY DEVICE */
+        j720_cf_identify(cf);
+        cf->error = 0;
+        cf->end = J720_CF_SECTOR;
+        cf->status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        j720_cf_set_intrq(s, true);
+        break;
+    case 0x20: case 0x21:           /* READ SECTORS */
+    case 0xc4:                      /* READ MULTIPLE */
+    case 0x30: case 0x31:           /* WRITE SECTORS */
+    case 0x38:                      /* CFA WRITE WITHOUT ERASE */
+    case 0xc5:                      /* WRITE MULTIPLE */
+    case 0x40: case 0x41:           /* READ VERIFY SECTORS */
+        lba = j720_cf_task_lba(cf);
+        if (lba < 0 || lba + count > cf->nb_sectors) {
+            j720_cf_done(s, ATA_ER_IDNF | ATA_ER_ABRT);
+            break;
+        }
+        if (!cf->writable && (cmd == 0x30 || cmd == 0x31 || cmd == 0x38 ||
+                              cmd == 0xc5)) {
+            j720_cf_done(s, ATA_ER_ABRT);
+            break;
+        }
+        cf->error = 0;
+        cf->lba = lba;
+        cf->xfer_left = count;
+        if (cmd == 0x40 || cmd == 0x41) {
+            j720_cf_set_task_lba(cf, lba + count - 1);
+            cf->nsector = 0;
+            j720_cf_done(s, 0);
+        } else if (cmd == 0x30 || cmd == 0x31 || cmd == 0x38 ||
+                   cmd == 0xc5) {
+            /* the first block of a PIO out command has no interrupt */
+            cf->end = J720_CF_SECTOR;
+            cf->status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        } else {
+            j720_cf_read_sector(s);
+        }
+        break;
+    case 0xc6:                      /* SET MULTIPLE MODE */
+        j720_cf_done(s, cf->nsector > 1 ? ATA_ER_ABRT : 0);
+        break;
+    case 0x91:                      /* INITIALIZE DEVICE PARAMETERS */
+        if (!cf->nsector) {
+            j720_cf_done(s, ATA_ER_ABRT);
+            break;
+        }
+        cf->heads = (cf->select & 0x0f) + 1;
+        cf->secs = cf->nsector;
+        cf->cyls = MAX(1, MIN(cf->nb_sectors / (cf->heads * cf->secs),
+                              65535));
+        j720_cf_done(s, 0);
+        break;
+    case 0x90:                      /* EXECUTE DEVICE DIAGNOSTIC */
+        j720_cf_ata_reset(s);
+        j720_cf_set_intrq(s, true);
+        break;
+    case 0xe7:                      /* FLUSH CACHE */
+        j720_cf_done(s, cf->writable && blk_flush(cf->blk) < 0 ?
+                        ATA_ER_ABRT : 0);
+        break;
+    case 0xe5: case 0x98:           /* CHECK POWER MODE: active */
+        cf->nsector = 0xff;
+        j720_cf_done(s, 0);
+        break;
+    case 0x10 ... 0x1f:             /* RECALIBRATE */
+    case 0x70:                      /* SEEK */
+    case 0x03:                      /* CFA REQUEST EXTENDED ERROR */
+    case 0xc0:                      /* CFA ERASE SECTORS */
+    case 0xef:                      /* SET FEATURES */
+    case 0xe0 ... 0xe4: case 0xe6:  /* standby, idle, sleep */
+    case 0x94 ... 0x97: case 0x99:
+        j720_cf_done(s, 0);
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "j720.cf: ATA command 0x%02x\n", cmd);
+        j720_cf_done(s, ATA_ER_ABRT);
+        break;
+    }
+}
+
+static uint32_t j720_cf_data_read(J720SA1111State *s, unsigned size)
+{
+    J720CFCard *cf = &s->cf;
+    uint32_t v = 0;
+    unsigned i;
+
+    for (i = 0; i < size && cf->pos < cf->end; i++) {
+        v |= cf->buf[cf->pos++] << (8 * i);
+        if (cf->pos == cf->end) {
+            j720_cf_buffer_done(s);
+        }
+    }
+    return v;
+}
+
+static void j720_cf_data_write(J720SA1111State *s, uint32_t value,
+                               unsigned size)
+{
+    J720CFCard *cf = &s->cf;
+    unsigned i;
+
+    for (i = 0; i < size && cf->pos < cf->end; i++) {
+        cf->buf[cf->pos++] = value >> (8 * i);
+        if (cf->pos == cf->end) {
+            j720_cf_buffer_done(s);
+        }
+    }
+}
+
+/* one 8-bit register of the CF register map, other than data */
+static uint8_t j720_cf_reg_read(J720SA1111State *s, int reg)
+{
+    J720CFCard *cf = &s->cf;
+
+    switch (reg) {
+    case 0x1: case 0xd: return cf->error;
+    case 0x2: return cf->nsector;
+    case 0x3: return cf->sector;
+    case 0x4: return cf->lcyl;
+    case 0x5: return cf->hcyl;
+    case 0x6: return cf->select;
+    case 0x7:
+        if (cf->select & ATA_DH_DEV) {
+            return 0;
+        }
+        j720_cf_set_intrq(s, false);
+        return cf->status;
+    case 0xe:
+        return cf->select & ATA_DH_DEV ? 0 : cf->status;
+    default:
+        return 0xff;
+    }
+}
+
+static void j720_cf_reg_write(J720SA1111State *s, int reg, uint8_t value)
+{
+    J720CFCard *cf = &s->cf;
+
+    switch (reg) {
+    case 0x1: case 0xd: cf->feature = value; break;
+    case 0x2: cf->nsector = value; break;
+    case 0x3: cf->sector = value; break;
+    case 0x4: cf->lcyl = value; break;
+    case 0x5: cf->hcyl = value; break;
+    case 0x6: cf->select = value; break;
+    case 0x7: j720_cf_command(s, value); break;
+    case 0xe:
+        if ((cf->devctl & ATA_DC_SRST) && !(value & ATA_DC_SRST)) {
+            j720_cf_ata_reset(s);
+        } else if (value & ATA_DC_SRST) {
+            cf->status = ATA_SR_BSY;
+        }
+        cf->devctl = value;
+        j720_cf_update(s);
+        break;
+    }
+}
+
+/*
+ * Data at 0 and 8 (odd byte at 9); a 16-bit access elsewhere covers two
+ * adjacent registers.
+ */
+static uint64_t j720_cf_access_read(J720SA1111State *s, int reg,
+                                    unsigned size)
+{
+    if (reg == 0 || reg == 8 || (reg == 9 && size == 1)) {
+        return j720_cf_data_read(s, size);
+    }
+    if (size == 2) {
+        return j720_cf_reg_read(s, reg) | j720_cf_reg_read(s, reg + 1) << 8;
+    }
+    return j720_cf_reg_read(s, reg);
+}
+
+static void j720_cf_access_write(J720SA1111State *s, int reg,
+                                 uint64_t value, unsigned size)
+{
+    if (reg == 0 || reg == 8 || (reg == 9 && size == 1)) {
+        j720_cf_data_write(s, value, size);
+        return;
+    }
+    if (size == 2) {
+        j720_cf_reg_write(s, reg, value);
+        j720_cf_reg_write(s, reg + 1, value >> 8);
+        return;
+    }
+    j720_cf_reg_write(s, reg, value);
+}
+
+/* the register an I/O address selects in the current configuration */
+static int j720_cf_io_reg(J720CFCard *cf, hwaddr addr)
+{
+    switch (cf->cor & COR_INDEX_MASK) {
+    case 0:
+        return -1;                  /* memory mapped */
+    case 1:
+        return addr & 0xf;
+    default:                        /* 0x1f0-0x1f7/0x3f6-0x3f7 and 0x17x */
+        if ((addr & 0x20e) == 0x206) {
+            return 0xe + (addr & 1);
+        }
+        return addr & 0x7;
+    }
+}
+
+static uint64_t j720_cf_io_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720SA1111State *s = opaque;
+    int reg = s->cf.inserted ? j720_cf_io_reg(&s->cf, addr) : -1;
+
+    return reg < 0 ? (1ULL << (size * 8)) - 1
+                   : j720_cf_access_read(s, reg, size);
+}
+
+static void j720_cf_io_write(void *opaque, hwaddr addr, uint64_t value,
+                             unsigned size)
+{
+    J720SA1111State *s = opaque;
+    int reg = s->cf.inserted ? j720_cf_io_reg(&s->cf, addr) : -1;
+
+    if (reg >= 0) {
+        j720_cf_access_write(s, reg, value, size);
+    }
+}
+
+/* common memory: the registers in configuration 0, data at 0x400-0x7ff */
+static int j720_cf_mem_reg(J720CFCard *cf, hwaddr addr)
+{
+    if (!cf->inserted || (cf->cor & COR_INDEX_MASK)) {
+        return -1;
+    }
+    addr &= 0x7ff;
+    return addr >= 0x400 ? (addr & 1 ? 9 : 8) : addr & 0xf;
+}
+
+static uint64_t j720_cf_mem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720SA1111State *s = opaque;
+    int reg = j720_cf_mem_reg(&s->cf, addr);
+
+    return reg < 0 ? (1ULL << (size * 8)) - 1
+                   : j720_cf_access_read(s, reg, size);
+}
+
+static void j720_cf_mem_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned size)
+{
+    J720SA1111State *s = opaque;
+    int reg = j720_cf_mem_reg(&s->cf, addr);
+
+    if (reg >= 0) {
+        j720_cf_access_write(s, reg, value, size);
+    }
+}
+
+/*
+ * CIS of a CF storage card: fixed disk, ATA interface; configuration
+ * registers at 0x200; four configurations (see "CF card" above).
+ */
+static const uint8_t j720_cf_cis[] = {
+    0x01, 0x03, 0xd9, 0x01, 0xff,               /* DEVICE: 2 KiB */
+    0x15, 0x1a, 0x04, 0x01,                     /* VERS_1 4.1 */
+    'Q', 'E', 'M', 'U', 0,
+    'C', 'o', 'm', 'p', 'a', 'c', 't', 'F', 'l', 'a', 's', 'h', ' ',
+    'C', 'a', 'r', 'd', 0, 0xff,
+    0x21, 0x02, 0x04, 0x01,                     /* FUNCID: fixed disk */
+    0x22, 0x02, 0x01, 0x01,                     /* FUNCE: ATA interface */
+    0x22, 0x03, 0x02, 0x0c, 0x0f,               /* FUNCE: ATA features */
+    0x1a, 0x05, 0x01, 0x03, 0x00, 0x02, 0x0f,   /* CONFIG: 0x200, last 3 */
+    /*
+     * Each entry: Vcc 3.3 V (ATADISK.DLL picks an entry by nominal Vcc),
+     * then the interface it describes.
+     * 0: memory mapped, 2 KiB; default
+     */
+    0x1b, 0x08, 0xc0, 0xc0, 0x21, 0x01, 0xb5, 0x1e, 0x08, 0x00,
+    /* 1: 16 I/O ports anywhere, any IRQ */
+    0x1b, 0x0a, 0x81, 0x41, 0x19, 0x01, 0xb5, 0x1e, 0x64, 0x30, 0xff, 0xff,
+    /* 2: 0x1f0-0x1f7 and 0x3f6-0x3f7, IRQ 14 */
+    0x1b, 0x0f, 0x82, 0x41, 0x19, 0x01, 0xb5, 0x1e, 0xea, 0x61,
+    0xf0, 0x01, 0x07, 0xf6, 0x03, 0x01, 0x2e,
+    /* 3: 0x170-0x177 and 0x376-0x377, IRQ 15 */
+    0x1b, 0x0f, 0x83, 0x41, 0x19, 0x01, 0xb5, 0x1e, 0xea, 0x61,
+    0x70, 0x01, 0x07, 0x76, 0x03, 0x01, 0x2f,
+    0x14, 0x00,                                 /* NO_LINK */
+    0xff,                                       /* END */
+};
+
+static uint64_t j720_cf_attr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    J720SA1111State *s = opaque;
+    uint32_t off = addr & ~1;
+    uint8_t b = 0xff;
+
+    if (!s->cf.inserted || (addr & 1)) {
+        return (1ULL << (size * 8)) - 1;
+    }
+    if (off / 2 < sizeof(j720_cf_cis)) {
+        b = j720_cf_cis[off / 2];
+    } else if (off == J720_CF_COR) {
+        b = s->cf.cor;
+    } else if (off == J720_CF_CCSR) {
+        b = s->cf.ccsr;
+    }
+    return size == 2 ? b | 0xff00 : b;
+}
+
+static void j720_cf_attr_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned size)
+{
+    J720SA1111State *s = opaque;
+    J720CFCard *cf = &s->cf;
+
+    if (!cf->inserted) {
+        return;
+    }
+    switch (addr) {
+    case J720_CF_COR:
+        if (value & COR_SRESET) {
+            j720_cf_reset(s);
+            break;
+        }
+        cf->cor = value;
+        j720_cf_update(s);
+        break;
+    case J720_CF_CCSR:
+        cf->ccsr = (cf->ccsr & CCSR_INTR) | (value & ~CCSR_INTR);
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps j720_cf_io_ops = {
+    .read = j720_cf_io_read,
+    .write = j720_cf_io_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 2,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static const MemoryRegionOps j720_cf_mem_ops = {
+    .read = j720_cf_mem_read,
+    .write = j720_cf_mem_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 2,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static const MemoryRegionOps j720_cf_attr_ops = {
+    .read = j720_cf_attr_read,
+    .write = j720_cf_attr_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 2,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static uint64_t j720_sa1111_intc_read(void *opaque, hwaddr addr,
                                       unsigned size)
 {
@@ -1467,8 +2219,8 @@ static void j720_sa1111_intc_write(void *opaque, hwaddr addr, uint64_t value,
     switch (addr) {
     case SA1111_INTEN0:      s->inten[0] = value; break;
     case SA1111_INTEN1:      s->inten[1] = value; break;
-    case SA1111_INTPOL0:     s->intpol[0] = value; break;
-    case SA1111_INTPOL1:     s->intpol[1] = value; break;
+    case SA1111_INTPOL0:     j720_sa1111_set_intpol(s, 0, value); break;
+    case SA1111_INTPOL1:     j720_sa1111_set_intpol(s, 1, value); break;
     case SA1111_INTSTATCLR0: s->intstat[0] &= ~value; break;
     case SA1111_INTSTATCLR1: s->intstat[1] &= ~value; break;
     case SA1111_INTSET0:     s->intstat[0] |= value; break;
@@ -1506,11 +2258,12 @@ static uint64_t j720_sa1111_pcmcia_read(void *opaque, hwaddr addr,
     case SA1111_PCSSR:
         return s->pcssr;
     case SA1111_PCSR:
-        /* socket 0: 3.3 V card present; socket 1: empty */
+        /* socket 0: 3.3 V card present; socket 1: 3.3 V card or empty */
         return (j720_card_ready(s) ? PCSR_S0_READY : 0) | PCSR_S0_VS2 |
                PCSR_S0_BVD1 | PCSR_S0_BVD2 |
-               PCSR_S1_DETECT | PCSR_S1_VS1 | PCSR_S1_VS2 |
-               PCSR_S1_BVD1 | PCSR_S1_BVD2;
+               (j720_cf_ready(s) ? PCSR_S1_READY : 0) |
+               (s->cf.inserted ? 0 : PCSR_S1_DETECT | PCSR_S1_VS1) |
+               PCSR_S1_VS2 | PCSR_S1_BVD1 | PCSR_S1_BVD2;
     default:
         qemu_log_mask(LOG_UNIMP, "j720.sa1111-pcmcia: read 0x%02" HWADDR_PRIx
                       "\n", addr);
@@ -1529,8 +2282,12 @@ static void j720_sa1111_pcmcia_write(void *opaque, hwaddr addr,
             s->cor = 0;
             ne2000_reset(&s->ne2000);
         }
+        if ((value & PCCR_S1_RST) && !(s->pccr & PCCR_S1_RST)) {
+            j720_cf_reset(s);
+        }
         s->pccr = value;
         j720_card_update(s);
+        j720_cf_update(s);
         break;
     case SA1111_PCSSR:
         s->pcssr = value;
@@ -1726,6 +2483,15 @@ static void j720_sa1111_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->pcmcia_io);
     sysbus_init_mmio(sbd, &s->card_io);
     sysbus_init_mmio(sbd, &s->card_attr);
+    memory_region_init_io(&s->cf_io, OBJECT(dev), &j720_cf_io_ops, s,
+                          "j720.pcmcia1-io", J720_PCMCIA_WINDOW);
+    memory_region_init_io(&s->cf_attr, OBJECT(dev), &j720_cf_attr_ops, s,
+                          "j720.pcmcia1-attr", J720_PCMCIA_WINDOW);
+    memory_region_init_io(&s->cf_mem, OBJECT(dev), &j720_cf_mem_ops, s,
+                          "j720.pcmcia1-mem", J720_PCMCIA_WINDOW);
+    sysbus_init_mmio(sbd, &s->cf_io);
+    sysbus_init_mmio(sbd, &s->cf_attr);
+    sysbus_init_mmio(sbd, &s->cf_mem);
     sysbus_init_irq(sbd, &s->irq);
 
     ne2000_setup_io(ne, dev, 0x20);
@@ -1743,21 +2509,105 @@ static void j720_sa1111_realize(DeviceState *dev, Error **errp)
     qemu_format_nic_info_str(qemu_get_queue(ne->nic), ne->c.macaddr.a);
     j720_card_build_cis(s);
 
-    s->intin[1] = 1u << SA1111_IRQ_S0_READY_NINT;  /* card ready */
+    /* socket 0: card present and ready; socket 1 empty for now */
+    s->intin[1] = 1u << SA1111_IRQ_S0_READY_NINT |
+                  1u << SA1111_IRQ_S1_CD_VALID;
+
+    if (s->cf.blk) {
+        if (blk_attach_dev(s->cf.blk, dev) < 0) {
+            error_setg(errp, "CF card drive is already in use");
+            return;
+        }
+        j720_cf_set_perm(&s->cf);
+        blk_set_dev_ops(s->cf.blk, &j720_cf_block_ops, s);
+        s->cf.resume_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                          j720_cf_resume_timer, s);
+        if (blk_is_inserted(s->cf.blk)) {
+            j720_cf_set_inserted(s, true);
+        }
+    }
+    j720_cf_reset(s);
+}
+
+/* a state saved before the CF card existed has the slot empty */
+static int j720_sa1111_pre_load(void *opaque)
+{
+    J720SA1111State *s = opaque;
+
+    s->cf.inserted = false;
+    return 0;
 }
 
 static int j720_sa1111_post_load(void *opaque, int version_id)
 {
     J720SA1111State *s = opaque;
+    J720CFCard *cf = &s->cf;
+    bool medium = cf->blk && blk_is_inserted(cf->blk);
 
+    /* card detect is active low; older states have both inputs low */
+    s->intin[1] &= ~(1u << SA1111_IRQ_S0_CD_VALID);
+    s->intin[1] = deposit32(s->intin[1], SA1111_IRQ_S1_CD_VALID, 1,
+                            !cf->inserted);
+    /*
+     * The CF medium is whatever this run was started with, and it may
+     * have been changed on the host meanwhile. So CE sees the card in the
+     * slot pulled out and the medium, if any, put in afresh: it drops
+     * what it cached of the old one. Once the machine runs, not while
+     * devices loaded after this one could still overwrite the interrupt.
+     */
+    if (cf->inserted || medium) {
+        timer_mod(cf->resume_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    }
+    if (medium) {
+        cf->nb_sectors = MAX(blk_getlength(cf->blk), 0) / J720_CF_SECTOR;
+    }
     j720_sa1111_update(s);
     return 0;
 }
+
+static bool j720_cf_needed(void *opaque)
+{
+    return true;
+}
+
+/* a subsection, so states saved before the CF card still load */
+static const VMStateDescription vmstate_j720_cf = {
+    .name = TYPE_J720_SA1111 "/cf",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = j720_cf_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(cf.inserted, J720SA1111State),
+        VMSTATE_UINT16(cf.cyls, J720SA1111State),
+        VMSTATE_UINT16(cf.heads, J720SA1111State),
+        VMSTATE_UINT16(cf.secs, J720SA1111State),
+        VMSTATE_UINT8(cf.cor, J720SA1111State),
+        VMSTATE_UINT8(cf.ccsr, J720SA1111State),
+        VMSTATE_BOOL(cf.intrq, J720SA1111State),
+        VMSTATE_UINT8(cf.feature, J720SA1111State),
+        VMSTATE_UINT8(cf.error, J720SA1111State),
+        VMSTATE_UINT8(cf.nsector, J720SA1111State),
+        VMSTATE_UINT8(cf.sector, J720SA1111State),
+        VMSTATE_UINT8(cf.lcyl, J720SA1111State),
+        VMSTATE_UINT8(cf.hcyl, J720SA1111State),
+        VMSTATE_UINT8(cf.select, J720SA1111State),
+        VMSTATE_UINT8(cf.status, J720SA1111State),
+        VMSTATE_UINT8(cf.devctl, J720SA1111State),
+        VMSTATE_UINT8(cf.cmd, J720SA1111State),
+        VMSTATE_UINT8_ARRAY(cf.buf, J720SA1111State, J720_CF_SECTOR),
+        VMSTATE_UINT32(cf.pos, J720SA1111State),
+        VMSTATE_UINT32(cf.end, J720SA1111State),
+        VMSTATE_UINT32(cf.xfer_left, J720SA1111State),
+        VMSTATE_UINT64(cf.lba, J720SA1111State),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_j720_sa1111 = {
     .name = TYPE_J720_SA1111,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_load = j720_sa1111_pre_load,
     .post_load = j720_sa1111_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(inten, J720SA1111State, 2),
@@ -1774,6 +2624,10 @@ static const VMStateDescription vmstate_j720_sa1111 = {
         VMSTATE_STRUCT(ne2000, J720SA1111State, 0, vmstate_ne2000,
                        NE2000State),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_j720_cf,
+        NULL
     }
 };
 
@@ -1975,7 +2829,18 @@ static void jornada720_init(MachineState *machine)
     {
         DeviceState *dev = qdev_new(TYPE_J720_SA1111);
         SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+        BlockBackend *cf = blk_by_name("cf");
 
+        /*
+         * The CF slot's medium: -drive if=none,id=cf,file=...,format=raw,
+         * or an empty drive "cf" for the monitor's change command.
+         */
+        if (!cf) {
+            cf = blk_by_legacy_dinfo(drive_new(drive_add(IF_NONE, -1, NULL,
+                                                         "id=cf"),
+                                               IF_NONE, &error_fatal));
+        }
+        J720_SA1111(dev)->cf.blk = cf;
         qemu_configure_nic_device(dev, true, NULL);
         sysbus_realize_and_unref(sbd, &error_fatal);
         memory_region_add_subregion_overlap(get_system_memory(),
@@ -1984,6 +2849,9 @@ static void jornada720_init(MachineState *machine)
                 J720_SA1111_PCMCIA_BASE, sysbus_mmio_get_region(sbd, 1), 1);
         sysbus_mmio_map(sbd, 2, J720_PCMCIA_S0_IO);
         sysbus_mmio_map(sbd, 3, J720_PCMCIA_S0_ATTR);
+        sysbus_mmio_map(sbd, 4, J720_PCMCIA_S1_IO);
+        sysbus_mmio_map(sbd, 5, J720_PCMCIA_S1_ATTR);
+        sysbus_mmio_map(sbd, 6, J720_PCMCIA_S1_MEM);
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(jms->sa1110->gpio,
                                                     J720_GPIO_SA1111_IRQ));
     }
