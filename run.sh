@@ -8,6 +8,8 @@
 #                         old callers)
 #   ./run.sh --vnc        no window, VNC on localhost:5900
 #   ./run.sh --fresh      forget the saved state, cold boot (hard reset)
+#   ./run.sh --cf PATH    put a CF card in the slot: a disk image, or a
+#                         host directory synced with it; --cf none empties it
 #   ./run.sh -- <args>    pass extra arguments to QEMU
 #
 # The machine is suspended to a file on quit and resumed from it on the
@@ -26,6 +28,13 @@
 # /files/, the host folder ~/jornada-files (or $J720_FILES) for
 # downloading into CE. Its log: $STATE_DIR/frogfind.log.
 #
+# The CF card stays in the slot across runs, like in the real device: its
+# path is kept in $STATE_DIR/cf. CE mounts it as \Storage Card. A
+# directory's card is built from it at start and CE's changes are copied
+# back when the emulator quits.
+# j720-cf.py swaps cards while the emulator runs (through the control
+# QMP socket $XDG_RUNTIME_DIR/j720-ctl.sock) and makes card images.
+#
 # The window is filled with the 640x240 screen scaled "sharp bilinear"
 # (nearest by a whole factor, then linear for the rest).
 # QEMU_SDL_SCALE=integer keeps whole factors only (crisp, with borders),
@@ -41,12 +50,14 @@
 # on the taskbar comes from the RTC, which follows the host in both.
 set -e
 
+start_dir=$PWD
 cd "$(dirname "$0")"
 
 QEMU=./build/qemu-system-arm
 ROM=roms/jornada720.bin
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/qemu-jornada720
 STATE=$STATE_DIR/j720.state
+CF_CARD=$STATE_DIR/cf
 
 [ -x "$QEMU" ] || { echo "no $QEMU, build it first: ninja -C build qemu-system-arm" >&2; exit 1; }
 [ -f "$ROM" ] || { echo "no ROM image at $ROM" >&2; exit 1; }
@@ -59,6 +70,18 @@ while [ $# -gt 0 ]; do
         --fast) icount="shift=6,align=off" ;;
         --vnc) display="-display none -vnc 127.0.0.1:0" ;;
         --fresh) rm -f "$STATE" ;;
+        --cf)
+            [ $# -ge 2 ] || { echo "run.sh: --cf needs a path or none" >&2; exit 1; }
+            shift
+            mkdir -p "$STATE_DIR"
+            case "$1" in
+                none) rm -f "$CF_CARD" ;;
+                *)  card=$1
+                    case "$card" in /*) ;; *) card=$start_dir/$card ;; esac
+                    [ -e "$card" ] || { echo "run.sh: no CF card at $card" >&2; exit 1; }
+                    echo "$card" > "$CF_CARD" ;;
+            esac
+            ;;
         --) shift; break ;;
         *) break ;;
     esac
@@ -91,6 +114,16 @@ if [ -n "$php" ]; then
 fi
 
 QMP_SOCK=${XDG_RUNTIME_DIR:-/tmp}/j720-qmp.$$.sock
+CTL_SOCK=${XDG_RUNTIME_DIR:-/tmp}/j720-ctl.sock
+
+# The CF slot: a drive "cf", empty or with the card left in it (for a
+# directory, its freshly built image). A path goes into -drive with its
+# commas doubled.
+cf_drive=if=none,id=cf
+cf_file=$(python3 ./j720-cf.py prepare) || cf_file=
+if [ -n "$cf_file" ]; then
+    cf_drive=$cf_drive,format=raw,file=$(printf '%s' "$cf_file" | sed 's/,/,,/g')
+fi
 
 # run_qemu [--incoming] <QEMU args>: QEMU pauses on shutdown instead of
 # exiting, j720-save.py then saves the machine and quits it. Returns 3
@@ -107,6 +140,8 @@ run_qemu() {
         -drive if=pflash,format=raw,file="$ROM" \
         -icount "$icount" \
         -qmp unix:"$QMP_SOCK",server=on,wait=off \
+        -qmp unix:"$CTL_SOCK",server=on,wait=off \
+        -drive "$cf_drive" \
         -action shutdown=pause \
         -global migration.store-global-state=off \
         $display "$@" &
@@ -115,16 +150,23 @@ run_qemu() {
     python3 ./j720-save.py $save_opt "$QMP_SOCK" "$STATE" || save_status=$?
     status=0
     wait $qemu_pid || status=$?
-    rm -f "$QMP_SOCK"
+    rm -f "$QMP_SOCK" "$CTL_SOCK"
     [ $save_status -eq 3 ] && return 3
     return $status
 }
 
+status=0
 if [ -f "$STATE" ]; then
-    status=0
     run_qemu --incoming "$@" || status=$?
-    [ $status -eq 3 ] || exit $status
-    echo "run.sh: could not resume from $STATE, moved to $STATE.bad; cold boot" >&2
-    mv -f "$STATE" "$STATE.bad"
 fi
-run_qemu "$@"
+if [ ! -f "$STATE" ] || [ $status -eq 3 ]; then
+    if [ $status -eq 3 ]; then
+        echo "run.sh: could not resume from $STATE, moved to $STATE.bad; cold boot" >&2
+        mv -f "$STATE" "$STATE.bad"
+    fi
+    status=0
+    run_qemu "$@" || status=$?
+fi
+# what CE changed on a directory's card goes back into the directory
+python3 ./j720-cf.py sync || true
+exit $status
