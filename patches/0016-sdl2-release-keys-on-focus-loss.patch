@@ -1,0 +1,16 @@
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -731,6 +731,12 @@
+         if (gui_grab && !gui_fullscreen) {
+             sdl_grab_end(scon);
+         }
++        /*
++         * qemu-jornada720: keys released while another window has the
++         * focus (a compositor shortcut taking it mid-press) never reach
++         * us; let go of everything, like the GTK UI on focus-out.
++         */
++        sdl2_release_modifiers(scon);
+         break;
+     case SDL_WINDOWEVENT_RESTORED:
+         qemu_console_listener_set_refresh(&scon->dcl, GUI_REFRESH_INTERVAL_DEFAULT);

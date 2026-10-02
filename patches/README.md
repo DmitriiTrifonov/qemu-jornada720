@@ -27,6 +27,7 @@ git apply ../patches/0012-ui-text-hook-for-non-latin-host-layouts.patch
 git apply ../patches/0013-sdl2-integer-or-linear-scaling.patch
 git apply ../patches/0014-sdl2-hidpi-and-sharp-bilinear.patch
 git apply ../patches/0015-strongarm-cp15-crm-ignored-debug-regs.patch
+git apply ../patches/0016-sdl2-release-keys-on-focus-loss.patch
 ```
 
 - `0001-...` — подключает `jornada720.c` к сборке (Kconfig + meson.build);
@@ -114,3 +115,7 @@ git apply ../patches/0015-strongarm-cp15-crm-ignored-debug-regs.patch
   сохраняют и восстанавливают их при Suspend как `cN,cN,0`; UNDEF на
   `c2,c2` ронял CE. Убирает RAZ/WI-заглушку `c1,c1,0` из `0002`: с ней
   регистр управления сохранялся как 0 и CE просыпался с выключенным MMU.
+- `0016-...` — `ui/sdl2.c` (после `0009`): при потере фокуса окно
+  отпускает все клавиши, как GTK-интерфейс. Если сочетание sway забирало
+  фокус посреди нажатия, отпускание Shift до QEMU не доходило, и в CE
+  Shift оставался зажатым: стрелки и тапы выделяли.

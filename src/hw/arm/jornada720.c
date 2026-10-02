@@ -654,7 +654,11 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
     unsigned int lnx = evt->key.key;    /* Linux key code */
     bool down = evt->key.down;
 
-    if (j720_wake_on_input(down)) {
+    /*
+     * A release still counts while CE sleeps: dropping a modifier's
+     * would leave it held in CE after the wake.
+     */
+    if (j720_wake_on_input(down) && down) {
         return;
     }
     bool held;
@@ -809,6 +813,7 @@ static void j720_mcu_realize(SSIPeripheral *dev, Error **errp)
 static int j720_mcu_post_load(void *opaque, int version_id)
 {
     J720MCUState *s = opaque;
+    int code;
 
     if (s->out_len < 0 || s->out_len > (int)sizeof(s->out) ||
         s->out_pos < 0 || s->out_pos > s->out_len ||
@@ -820,6 +825,17 @@ static int j720_mcu_post_load(void *opaque, int version_id)
     if (s->kbd_line_low) {
         timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   J720_MCU_KBD_WATCHDOG_MS);
+    }
+    /*
+     * The host keyboard starts with every key up: let go of modifiers
+     * held when the state was saved, or CE keeps them pressed (Shift
+     * turning arrows and taps into selections).
+     */
+    for (code = 1; code < 128; code++) {
+        if (j720_mcu_held(s, code)) {
+            s->keydown[code / 8] &= ~(1 << code % 8);
+            j720_mcu_key_queue(s, code | 0x80);
+        }
     }
     return 0;
 }
