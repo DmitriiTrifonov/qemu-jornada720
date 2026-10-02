@@ -323,6 +323,8 @@ static bool j720_wake_on_input(bool press)
 #define J720_MCU_TS_MIN_SAMPLES 3
 /* ...but never hold a released pen down longer than this many periods */
 #define J720_MCU_TS_MAX_HOLD    20
+/* a touch that comes while the last one is held over waits this long */
+#define J720_MCU_TS_REPRESS_MS  30
 
 static const unsigned short j720_keymap[128] = {					/* ROW */
 	0, KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,		/* #1  */
@@ -373,6 +375,12 @@ struct J720MCUState {
     bool pen_down;
     bool pen_up_pending;        /* released before enough samples were read */
     int pen_up_ticks;           /* periods pen_up_pending has lasted (not migrated) */
+    /*
+     * Touched again while the last touch was still held over: press after
+     * CE has seen that one go up (else a double tap is one long touch);
+     * repress_up: released again meanwhile (neither is migrated)
+     */
+    bool repress, repress_up;
     int pen_samples;            /* GETTOUCHSAMPLES answered since pen down */
     int pen_x, pen_y;           /* 10-bit ADC values */
     int abs_x, abs_y;           /* last absolute pointer position from the UI */
@@ -693,18 +701,43 @@ static void j720_mcu_key_event(DeviceState *dev, QemuConsole *src,
     }
 }
 
+static void j720_mcu_pen_press(J720MCUState *s)
+{
+    s->pen_down = true;
+    s->pen_up_pending = false;
+    s->pen_up_ticks = 0;
+    s->pen_samples = 0;
+    qemu_irq_lower(s->ts_irq);
+    timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              J720_MCU_TS_PERIOD_MS);
+}
+
 static void j720_mcu_pen_up(J720MCUState *s)
 {
     s->pen_down = false;
     s->pen_up_pending = false;
     qemu_irq_raise(s->ts_irq);
-    timer_del(s->ts_timer);
+    if (s->repress) {
+        timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  J720_MCU_TS_REPRESS_MS);
+    } else {
+        timer_del(s->ts_timer);
+    }
 }
 
 static void j720_mcu_ts_tick(void *opaque)
 {
     J720MCUState *s = opaque;
 
+    if (!s->pen_down) {
+        if (s->repress) {
+            s->repress = false;
+            j720_mcu_pen_press(s);
+            s->pen_up_pending = s->repress_up;
+            s->repress_up = false;
+        }
+        return;
+    }
     if (s->pen_up_pending &&
         (s->pen_samples >= J720_MCU_TS_MIN_SAMPLES ||
          ++s->pen_up_ticks >= J720_MCU_TS_MAX_HOLD)) {
@@ -762,13 +795,14 @@ static void j720_mcu_pointer_event(DeviceState *dev, QemuConsole *src,
                     s->pen_x, s->pen_y, s->pen_samples);
         }
         if (btn->down) {
-            s->pen_down = true;
-            s->pen_up_pending = false;
-            s->pen_up_ticks = 0;
-            s->pen_samples = 0;
-            qemu_irq_lower(s->ts_irq);
-            timer_mod(s->ts_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-                      J720_MCU_TS_PERIOD_MS);
+            if (s->pen_up_pending || s->repress) {
+                s->repress = true;
+                s->repress_up = false;
+            } else {
+                j720_mcu_pen_press(s);
+            }
+        } else if (s->repress) {
+            s->repress_up = true;
         } else if (s->pen_samples < J720_MCU_TS_MIN_SAMPLES) {
             s->pen_up_pending = true;
         } else {
